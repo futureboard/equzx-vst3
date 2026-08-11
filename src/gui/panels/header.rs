@@ -82,19 +82,9 @@ pub fn show(
             swap_slots(frame, ui_state);
         }
     }
-    let copy = chrome::pill(
-        ui,
-        &format!("{} → {}", ui_state.slot.label(), ui_state.slot.other().label()),
-        Fill::Quiet,
-    );
-    if copy.clicked() {
+    if copy_button(ui, ui_state.slot).clicked() {
         ui_state.parked = edit::capture(frame.params);
     }
-    copy.on_hover_text(format!(
-        "Copy slot {} into {}",
-        ui_state.slot.label(),
-        ui_state.slot.other().label()
-    ));
 
     preset_menu(ui, frame, fx, state, ui_state);
 
@@ -145,6 +135,42 @@ pub fn show(
 
         output_gain(ui, frame);
     });
+}
+
+/// `A → B`, with the arrow drawn rather than typed — the bundled fonts have no
+/// arrow, and a missing glyph renders as an empty box.
+fn copy_button(ui: &mut Ui, slot: AbSlot) -> nih_plug_egui::egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(52.0, PILL_HEIGHT), Sense::click());
+    let fill = Fill::Quiet;
+    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, response.hovered());
+
+    let fg = fill.foreground(response.hovered());
+    let font = FontId::proportional(theme::SMALL);
+    ui.painter().text(
+        pos2(rect.min.x + 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        slot.label(),
+        font.clone(),
+        fg,
+    );
+    ui.painter().add(glyph::arrow_right(
+        Rect::from_center_size(rect.center(), vec2(14.0, 8.0)),
+        white(120),
+        1.4,
+    ));
+    ui.painter().text(
+        pos2(rect.max.x - 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        slot.other().label(),
+        font,
+        fg,
+    );
+
+    response.on_hover_text(format!(
+        "Copy slot {} into {}",
+        slot.label(),
+        slot.other().label()
+    ))
 }
 
 fn output_gain(ui: &mut Ui, frame: &Frame) {

@@ -18,6 +18,8 @@ pub mod edit;
 pub mod gpu;
 pub mod panels;
 pub mod presets;
+#[cfg(test)]
+pub mod preview;
 pub mod spectrum;
 pub mod state;
 pub mod theme;
@@ -772,6 +774,167 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Every character the UI puts on screen has to exist in the bundled fonts.
+    ///
+    /// A character the font cannot find renders as an empty box, and nothing
+    /// else catches it: it compiles, it lays out, it tessellates, and it is only
+    /// wrong to look at. This shipped once — `A → B` in the header, with the
+    /// arrow as a hollow rectangle — so the arrow is a drawn shape now and this
+    /// keeps the next one from getting that far.
+    #[test]
+    fn every_character_the_ui_draws_has_a_glyph() {
+        // Scanned out of the source rather than listed, so a new string with a
+        // new character in it is covered without anyone remembering to add it.
+        const SOURCES: [&str; 8] = [
+            include_str!("mod.rs"),
+            include_str!("display.rs"),
+            include_str!("panels/header.rs"),
+            include_str!("panels/band_strip.rs"),
+            include_str!("panels/overlays.rs"),
+            include_str!("panels/resonance.rs"),
+            include_str!("widgets/chrome.rs"),
+            include_str!("widgets/menu.rs"),
+        ];
+
+        let ctx = Context::default();
+        theme::apply(&ctx);
+        ctx.begin_pass(RawInput::default());
+
+        let font = nih_plug_egui::egui::FontId::proportional(theme::SMALL);
+        let mut missing: Vec<char> = Vec::new();
+        for source in SOURCES {
+            for c in string_literal_chars(source) {
+                if !c.is_ascii()
+                    && !missing.contains(&c)
+                    && !ctx.fonts(|f| f.has_glyph(&font, c))
+                {
+                    missing.push(c);
+                }
+            }
+        }
+        let _ = ctx.end_pass();
+
+        assert!(
+            missing.is_empty(),
+            "the bundled fonts have no glyph for {missing:?} — these draw as empty boxes"
+        );
+    }
+
+    /// Characters inside double-quoted literals, skipping escapes. Crude on
+    /// purpose: it only has to be good enough to find the text the UI draws,
+    /// and over-reporting a character from a comment would cost nothing anyway.
+    fn string_literal_chars(source: &str) -> Vec<char> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        let mut escaped = false;
+        for c in source.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match c {
+                '\\' if inside => escaped = true,
+                '"' => inside = !inside,
+                _ if inside => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Render a frame to a PNG and look at it.
+    ///
+    /// Not run by default — it writes a file and takes a second — but it is the
+    /// only thing in the suite that answers "what does it look like", so it
+    /// lives with the tests rather than in someone's shell history.
+    /// `cargo test --lib render_the_editor -- --ignored --nocapture`
+    #[test]
+    #[ignore = "writes a PNG; run explicitly"]
+    fn render_the_editor() {
+        let width = std::env::var("EQUZX_PREVIEW_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_WIDTH as f32);
+        let height = std::env::var("EQUZX_PREVIEW_H")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_HEIGHT as f32);
+
+        let (harness, mut view) = fixture_sized(width, height);
+        let bands = a_bit_of_everything();
+        view.selected = Some(1);
+
+        // A few passes, because the first is egui measuring its areas.
+        let mut atlas = None;
+        let mut primitives = Vec::new();
+        for _ in 0..4 {
+            let host = HeadlessHost;
+            let setter = ParamSetter::new(&host);
+            let level = vec![-22.0f32; MAX_BANDS];
+            let delta = vec![-3.5f32; MAX_BANDS];
+            let mut resonance = vec![0.0f32; RES_BANDS];
+            for (i, slot) in resonance.iter_mut().enumerate() {
+                *slot = (i as f32 * 0.35).sin().abs() * 5.0;
+            }
+            // A spectrum with some shape to it, so the analyser has something
+            // to draw other than a flat line on the floor.
+            let spectrum: Vec<f32> = (0..crate::analyzer::LOG_POINTS)
+                .map(|i| {
+                    let t = i as f32 / crate::analyzer::LOG_POINTS as f32;
+                    -34.0 - 46.0 * t + 9.0 * (t * 26.0).sin()
+                })
+                .collect();
+            let fx = view.fx.clone();
+            let frame = Frame {
+                setter: &setter,
+                params: &harness.params,
+                transient: &harness.transient,
+                level: &level,
+                delta: &delta,
+                resonance: &resonance,
+                resonance_peak: 5.0,
+                spectrum_pre: &spectrum,
+                spectrum_post: &spectrum,
+                sample_rate: 48_000.0,
+                fx: &fx,
+            };
+
+            harness.ctx.begin_pass(RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, harness.size)),
+                ..Default::default()
+            });
+            ResizableWindow::new("equzx-window")
+                .min_size(vec2(MIN_WIDTH, MIN_HEIGHT))
+                .show(&harness.ctx, &harness.editor_state, |ui| {
+                    layout(ui, &frame, &mut view, &bands);
+                });
+            let output = harness.ctx.end_pass();
+            if let Some(found) = preview::Atlas::from_delta(&output.textures_delta) {
+                atlas = Some(found);
+            }
+            primitives = harness.ctx.tessellate(output.shapes, 1.0);
+        }
+
+        let atlas = atlas.expect("egui never uploaded its font atlas");
+        let mut canvas =
+            preview::Canvas::new(width as usize, height as usize, theme::SURFACE_ROOT);
+        let skipped = canvas.draw(&primitives, &atlas);
+
+        let path = std::env::var("EQUZX_PREVIEW")
+            .unwrap_or_else(|_| "target/equzx-preview.png".to_owned());
+        std::fs::write(&path, canvas.to_png()).expect("could not write the preview");
+        println!(
+            "wrote {path} ({width}x{height}), {} primitives, {skipped} GPU callbacks skipped",
+            primitives.len()
+        );
+        for name in PANELS {
+            println!(
+                "  {name:<18} {:?}",
+                harness.ctx.memory(|m| m.area_rect(Id::new(name)))
+            );
         }
     }
 

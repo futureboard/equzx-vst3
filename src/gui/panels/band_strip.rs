@@ -160,104 +160,115 @@ fn chips(ui: &mut Ui, bands: &[BandView], selected: &mut Option<usize>, height: 
             .max_rect(rect)
             .layout(Layout::top_down(Align::Min)),
     );
+    column.spacing_mut().item_spacing = vec2(5.0, 5.0);
+
+    // Wrapped in the column rather than in a child with its own rectangle, so
+    // the count below lands directly under the last row of chips instead of at
+    // the bottom of whatever space the panel happens to have.
+    column.horizontal_wrapped(|grid| {
+        grid.spacing_mut().item_spacing = vec2(5.0, 5.0);
+        if bands.is_empty() {
+            grid.label(
+                nih_plug_egui::egui::RichText::new("No bands yet")
+                    .font(FontId::proportional(theme::TINY))
+                    .color(white(64)),
+            );
+        }
+        for (index, band) in bands.iter().enumerate() {
+            chip(grid, band, index, selected);
+        }
+    });
 
     let full = bands.len() >= MAX_BANDS;
-    let mut grid = column.new_child(
-        UiBuilder::new()
-            .max_rect(Rect::from_min_size(rect.min, vec2(188.0, height - 16.0)))
-            .layout(Layout::left_to_right(Align::Min).with_main_wrap(true)),
-    );
-    grid.spacing_mut().item_spacing = vec2(5.0, 5.0);
-
-    if bands.is_empty() {
-        grid.label(
-            nih_plug_egui::egui::RichText::new("No bands yet")
-                .font(FontId::proportional(theme::TINY))
-                .color(white(64)),
-        );
-    }
-    for (index, band) in bands.iter().enumerate() {
-        let color = band_color(index);
-        let active = *selected == Some(band.slot);
-        let (chip, response) = grid.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
-
-        let corner = theme::corner(theme::R_CHIP);
-        if active {
-            grid.painter().rect_filled(chip.expand(1.5), theme::corner(8), fade(color, 0.25));
-            grid.painter().rect_filled(chip, corner, color);
-        } else {
-            grid.painter().rect_filled(
-                chip,
-                corner,
-                if band.enabled { white(11) } else { Color32::TRANSPARENT },
-            );
-            grid.painter().rect_stroke(
-                chip,
-                corner,
-                Stroke::new(1.0, white(if response.hovered() { 64 } else { 26 })),
-                nih_plug_egui::egui::epaint::StrokeKind::Inside,
-            );
-        }
-
-        let fg = if active {
-            Color32::from_rgba_unmultiplied(0, 0, 0, 225)
-        } else if band.enabled {
-            white(160)
-        } else {
-            white(80)
-        };
-        grid.painter().text(
-            chip.center(),
-            Align2::CENTER_CENTER,
-            format!("{}", index + 1),
-            FontId::proportional(theme::SMALL),
-            fg,
-        );
-        if band.dynamic && band.can_be_dynamic() {
-            grid.painter().circle_filled(
-                pos2(chip.max.x - 3.0, chip.min.y + 3.0),
-                2.0,
-                if active { Color32::BLACK } else { color },
-            );
-        }
-        if !band.badge().is_empty() {
-            grid.painter().text(
-                pos2(chip.max.x - 2.0, chip.max.y - 1.0),
-                Align2::RIGHT_BOTTOM,
-                band.badge(),
-                FontId::proportional(7.0),
-                if active { Color32::BLACK } else { color },
-            );
-        }
-
-        if response.clicked() {
-            *selected = Some(band.slot);
-        }
-        response.on_hover_text(format!(
-            "{} · {}{}",
-            KIND_LABELS[KINDS.iter().position(|k| *k == band.kind).unwrap_or(2)],
-            fmt_band_freq(band.freq),
-            if band.badge().is_empty() {
-                String::new()
-            } else {
-                format!(" · {}", band.channel.as_wire())
-            }
-        ));
-    }
-
-    column.painter().text(
-        pos2(rect.min.x, rect.max.y - 8.0),
-        Align2::LEFT_CENTER,
-        format!(
+    column.add_space(2.0);
+    column.label(
+        nih_plug_egui::egui::RichText::new(format!(
             "{} / {} bands{}",
             bands.len(),
             MAX_BANDS,
             if full { " — limit reached" } else { "" }
-        ),
-        FontId::proportional(theme::MICRO),
-        if full { NEON } else { white(64) },
+        ))
+        .font(FontId::proportional(theme::MICRO))
+        .color(if full { NEON } else { white(64) }),
     );
+
     ui.allocate_rect(rect, Sense::hover());
+}
+
+/// One band chip: its number, its colour, and the two marks that say it is
+/// dynamic or that it acts on one side of the image only.
+fn chip(ui: &mut Ui, band: &BandView, index: usize, selected: &mut Option<usize>) {
+    let color = band_color(index);
+    let active = *selected == Some(band.slot);
+    let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+
+    let corner = theme::corner(theme::R_CHIP);
+    if active {
+        ui.painter()
+            .rect_filled(rect.expand(1.5), theme::corner(8), fade(color, 0.25));
+        ui.painter().rect_filled(rect, corner, color);
+    } else {
+        ui.painter().rect_filled(
+            rect,
+            corner,
+            if band.enabled {
+                white(11)
+            } else {
+                Color32::TRANSPARENT
+            },
+        );
+        ui.painter().rect_stroke(
+            rect,
+            corner,
+            Stroke::new(1.0, white(if response.hovered() { 64 } else { 26 })),
+            nih_plug_egui::egui::epaint::StrokeKind::Inside,
+        );
+    }
+
+    let fg = if active {
+        Color32::from_rgba_unmultiplied(0, 0, 0, 225)
+    } else if band.enabled {
+        white(160)
+    } else {
+        white(80)
+    };
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        format!("{}", index + 1),
+        FontId::proportional(theme::SMALL),
+        fg,
+    );
+    if band.dynamic && band.can_be_dynamic() {
+        ui.painter().circle_filled(
+            pos2(rect.max.x - 3.0, rect.min.y + 3.0),
+            2.0,
+            if active { Color32::BLACK } else { color },
+        );
+    }
+    if !band.badge().is_empty() {
+        ui.painter().text(
+            pos2(rect.max.x - 2.0, rect.max.y - 1.0),
+            Align2::RIGHT_BOTTOM,
+            band.badge(),
+            FontId::proportional(7.0),
+            if active { Color32::BLACK } else { color },
+        );
+    }
+
+    if response.clicked() {
+        *selected = Some(band.slot);
+    }
+    response.on_hover_text(format!(
+        "{} · {}{}",
+        KIND_LABELS[KINDS.iter().position(|k| *k == band.kind).unwrap_or(2)],
+        fmt_band_freq(band.freq),
+        if band.badge().is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", band.channel.as_wire())
+        }
+    ));
 }
 
 fn filter_row(
