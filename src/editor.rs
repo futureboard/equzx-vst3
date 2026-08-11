@@ -27,14 +27,14 @@ use crate::dsp::resonance::RES_BANDS;
 use crate::meters::Meters;
 use crate::params::{BandParams, EquzxParams, ResonanceParams, TransientState, MAX_BANDS};
 use crate::protocol::{
-    encode_reduction, parse_channel, parse_dyn_mode, parse_kind, parse_slope, state_message, Action,
-    BandPatch, FrameMessage, ResonancePatch, StateMessage,
+    encode_reduction, parse_channel, parse_dyn_mode, parse_kind, parse_slope, state_message,
+    Action, BandPatch, FrameMessage, ResonancePatch, StateMessage,
 };
 
 /// Wide enough for the band editor's full control row — type, frequency,
 /// gain, Q, slope, all five channels, and the on/solo/delete group.
-pub const DEFAULT_WIDTH: u32 = 1260;
-pub const DEFAULT_HEIGHT: u32 = 760;
+pub const DEFAULT_WIDTH: u32 = 1400;
+pub const DEFAULT_HEIGHT: u32 = 900;
 
 /// Everything the frame loop mutates. The loop closure is `Fn`, not `FnMut`, so
 /// this lives behind a lock — one only ever contended by the GUI thread itself.
@@ -227,7 +227,7 @@ pub fn create(ctx: EditorContext) -> WebViewEditor {
                 .read()
                 .map(|s| s.clone())
                 .unwrap_or_default();
-            let current = state_message(&ctx.params, ui, sr);
+            let current = state_message(&ctx.params, ui, sr, wv.scale());
             if st.cache.as_ref() != Some(&current) {
                 let changed_elsewhere = !ui_originated;
                 st.cache = Some(current.clone());

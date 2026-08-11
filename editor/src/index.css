@@ -71,8 +71,13 @@ svg text {
             rgba(255, 255, 255, 0.02) 45%,
             rgba(255, 255, 255, 0.05)
         );
+        /* Standard property only — the -webkit- form is applied separately
+       below, and must stay there. Writing the two next to each other made
+       Lightning CSS collapse the pair down to the prefixed one, and Chromium,
+       which is what WebView2 is, never supported -webkit-backdrop-filter: it
+       went straight to the standard property. The result was a glass UI with
+       no glass in it on Windows and Linux. */
         backdrop-filter: blur(26px) saturate(190%);
-        -webkit-backdrop-filter: blur(26px) saturate(190%);
         box-shadow:
             inset 0 1px 0 rgba(255, 255, 255, 0.2),
             inset 0 0 0 1px rgba(255, 255, 255, 0.07),
@@ -81,12 +86,59 @@ svg text {
             0 2px 8px -2px rgba(0, 0, 0, 0.5);
     }
 
+    /*
+   * Safari before 18 only knows the prefixed property. Kept in its own rule,
+   * behind a condition Chromium never matches, so nothing can merge it back
+   * together with the standard declaration and drop that one.
+   */
+    @supports (-webkit-backdrop-filter: blur(1px)) and
+        (not (backdrop-filter: blur(1px))) {
+        .glass {
+            -webkit-backdrop-filter: blur(26px) saturate(190%);
+        }
+
+        .glass-overlay {
+            -webkit-backdrop-filter: blur(22px) saturate(170%);
+        }
+    }
+
     /* Without a backdrop filter the tint alone is far too thin to read text on. */
     @supports not (
         (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))
     ) {
         .glass {
             background-color: rgba(21, 21, 23, 0.94);
+        }
+    }
+
+    /*
+   * The two panes that float in the corners of the plot.
+   *
+   * They have to recede until pointed at, or they compete with the curve — but
+   * doing that with `opacity` on the pane itself fades the frosted backdrop
+   * along with the text, and the frost is the part that has to keep working: it
+   * is what stops a busy spectrum from running straight through the labels. So
+   * the pane keeps its blur at full strength and the *contents* fade instead.
+   */
+    .glass-overlay {
+        backdrop-filter: blur(22px) saturate(170%);
+    }
+
+    .glass-overlay > * {
+        opacity: 0.6;
+        transition: opacity 200ms ease;
+    }
+
+    .glass-overlay:hover > *,
+    .glass-overlay:focus-within > * {
+        opacity: 1;
+    }
+
+    @supports not (
+        (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))
+    ) {
+        .glass-overlay {
+            background-color: rgba(21, 21, 23, 0.9);
         }
     }
 

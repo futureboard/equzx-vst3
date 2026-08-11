@@ -5,6 +5,7 @@ import { PluginBridge, type PluginState } from './audio/PluginBridge'
 import type { EqEngine } from './audio/engine'
 import { EQDisplay, type AnalyzerMode } from './components/EQDisplay'
 import { AnalyzerOverlay } from './components/AnalyzerOverlay'
+import { ViewOverlay } from './components/ViewOverlay'
 import { BandStrip } from './components/BandStrip'
 import { Header } from './components/Header'
 import { Transport } from './components/Transport'
@@ -102,6 +103,9 @@ export default function App() {
   const [outputGain, setOutputGain] = useState(0)
   const [maxBands, setMaxBands] = useState(MAX_BANDS)
   const [resonance, setResonance] = useState<Resonance>(defaultResonance)
+  // Display scale, so the resize grip knows how much of the screen a logical
+  // pixel actually costs.
+  const [displayScale, setDisplayScale] = useState(1)
 
   const [fileName, setFileName] = useState('')
   const [loading, setLoading] = useState(false)
@@ -197,6 +201,7 @@ export default function App() {
       setOutputGain(state.outputGain)
       setBypassed(state.bypass)
       setMaxBands(state.maxBands)
+      setDisplayScale(state.scale > 0 ? state.scale : 1)
       // The wire carries the bank's layout alongside its settings; only the
       // settings belong in React state, the layout travels with the curve.
       setResonance({
@@ -577,8 +582,6 @@ export default function App() {
                 />
               ) : null
             }
-            channelView={channelView}
-            dbRange={dbRange}
             outputGain={outputGain}
             bypassed={bypassed}
             slot={slot}
@@ -587,8 +590,6 @@ export default function App() {
             onLoadSnapshot={applySnapshot}
             onSwitchSlot={switchSlot}
             onCopyToOther={copyToOther}
-            onChannelView={setChannelView}
-            onDbRange={setDbRange}
             onOutputGain={changeOutputGain}
             onBypass={changeBypass}
             onReset={reset}
@@ -625,7 +626,18 @@ export default function App() {
               onAdd={addBand}
               onRemove={removeBand}
             />
-            {/* Sits inside the plot, top-right, over the analyser it controls. */}
+            {/* One overlay in each upper corner of the plot: what is being
+                shown on the left, how it is being analysed on the right.
+                Inset by the dB axis gutter — `PAD.left` in EQDisplay — so it
+                starts where the plot does rather than over the scale. */}
+            <div className="absolute left-10 top-3 z-20">
+              <ViewOverlay
+                channelView={channelView}
+                dbRange={dbRange}
+                onChannelView={setChannelView}
+                onDbRange={setDbRange}
+              />
+            </div>
             <div className="absolute right-3 top-3 z-20">
               <AnalyzerOverlay
                 analyzerMode={analyzerMode}
@@ -696,7 +708,7 @@ export default function App() {
       </div>
 
       {/* A page can't resize its own browser window, so this is plugin-only. */}
-      {bridge && <WindowResizer onResize={resizeWindow} />}
+      {bridge && <WindowResizer onResize={resizeWindow} scale={displayScale} />}
 
       {webEngine && (
         <div

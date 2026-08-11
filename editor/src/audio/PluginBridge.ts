@@ -46,6 +46,8 @@ export interface PluginState {
   bypass: boolean
   sampleRate: number
   maxBands: number
+  /** Display scale the editor is drawn at; 1 at 100%. */
+  scale: number
   resonance: ResonanceWire
   /** Opaque view state the plugin stores with the session. */
   ui: string
@@ -254,6 +256,7 @@ export class PluginBridge implements EqEngine {
         bypass: m.bypass,
         sampleRate: m.sampleRate,
         maxBands: m.maxBands,
+        scale: m.scale || 1,
         resonance: m.resonance ?? { ...defaultResonance(), ...this.resLayout, bands: RES_BANDS },
         ui: m.ui,
       }

@@ -7,14 +7,49 @@ import { useCallback, useEffect, useRef, useState } from 'react'
  */
 export const WINDOW_MIN_WIDTH = 640
 export const WINDOW_MIN_HEIGHT = 420
-export const WINDOW_DEFAULT_WIDTH = 1260
-export const WINDOW_DEFAULT_HEIGHT = 760
+export const WINDOW_DEFAULT_WIDTH = 1400
+export const WINDOW_DEFAULT_HEIGHT = 900
 const WINDOW_MAX_WIDTH = 3840
 const WINDOW_MAX_HEIGHT = 2400
 
+/**
+ * Room to leave for the frame the host wraps around us.
+ *
+ * A plugin window is never alone: the DAW adds a title bar, and often a toolbar
+ * strip above the editor as well — FL Studio's is around sixty pixels. Dragging
+ * to a size that leaves no room for that means asking for a window the host
+ * cannot give, and what comes back is a size the user did not choose.
+ */
+const HOST_CHROME_WIDTH = 32
+const HOST_CHROME_HEIGHT = 140
+
+/**
+ * The largest window that can actually be honoured here.
+ *
+ * Bounded by the display rather than by a number picked out of the air: no host
+ * will hand out a window bigger than the screen, so letting the grip drag past
+ * it only produces a silent snap back to whatever the host decided instead.
+ */
+function maxSize(scale: number): { width: number; height: number } {
+  const screen = window.screen
+  // `screen` reports device pixels however the webview is zoomed, and the sizes
+  // here are logical, so a logical pixel costs `scale` of the screen's.
+  const div = scale > 0 ? scale : 1
+  const width = screen?.availWidth ? screen.availWidth / div - HOST_CHROME_WIDTH : WINDOW_MAX_WIDTH
+  const height = screen?.availHeight
+    ? screen.availHeight / div - HOST_CHROME_HEIGHT
+    : WINDOW_MAX_HEIGHT
+  return {
+    width: Math.max(WINDOW_MIN_WIDTH, Math.min(WINDOW_MAX_WIDTH, width)),
+    height: Math.max(WINDOW_MIN_HEIGHT, Math.min(WINDOW_MAX_HEIGHT, height)),
+  }
+}
+
 interface Props {
-  /** Hand the plugin a new window size, in CSS pixels. */
+  /** Hand the plugin a new window size, in logical pixels. */
   onResize: (width: number, height: number) => void
+  /** Display scale the editor is drawn at; 1 at 100%. */
+  scale: number
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -43,7 +78,7 @@ function clamp(value: number, min: number, max: number): number {
  *
  * Only meaningful inside the plugin; a page can't resize its own browser window.
  */
-export function WindowResizer({ onResize }: Props) {
+export function WindowResizer({ onResize, scale }: Props) {
   const [dragging, setDragging] = useState(false)
   /** Where the press happened, and how big the window was at the time. */
   const start = useRef<{ x: number; y: number; w: number; h: number } | null>(null)
@@ -67,9 +102,10 @@ export function WindowResizer({ onResize }: Props) {
     const move = (ev: PointerEvent) => {
       const from = start.current
       if (!from) return
+      const max = maxSize(scale)
       pending.current = {
-        width: clamp(from.w + (ev.screenX - from.x), WINDOW_MIN_WIDTH, WINDOW_MAX_WIDTH),
-        height: clamp(from.h + (ev.screenY - from.y), WINDOW_MIN_HEIGHT, WINDOW_MAX_HEIGHT),
+        width: clamp(from.w + (ev.screenX - from.x), WINDOW_MIN_WIDTH, max.width),
+        height: clamp(from.h + (ev.screenY - from.y), WINDOW_MIN_HEIGHT, max.height),
       }
       if (!frame.current) frame.current = requestAnimationFrame(flush)
     }
@@ -90,7 +126,7 @@ export function WindowResizer({ onResize }: Props) {
       window.removeEventListener('pointerup', up)
       window.removeEventListener('pointercancel', up)
     }
-  }, [dragging, flush])
+  }, [dragging, flush, scale])
 
   useEffect(
     () => () => {
@@ -121,7 +157,13 @@ export function WindowResizer({ onResize }: Props) {
         }
         setDragging(true)
       }}
-      onDoubleClick={() => onResize(WINDOW_DEFAULT_WIDTH, WINDOW_DEFAULT_HEIGHT)}
+      onDoubleClick={() => {
+        const max = maxSize(scale)
+        onResize(
+          Math.min(WINDOW_DEFAULT_WIDTH, max.width),
+          Math.min(WINDOW_DEFAULT_HEIGHT, max.height),
+        )
+      }}
     >
       <svg width={16} height={16} viewBox="0 0 16 16" aria-hidden>
         <g stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" fill="none">

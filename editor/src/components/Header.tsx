@@ -1,8 +1,7 @@
 import type { ReactNode } from "react";
-import { CONTROL, Dropdown, Menu, MenuDivider, MenuItem } from "./ui/Menu";
+import { CONTROL, Menu, MenuDivider, MenuItem } from "./ui/Menu";
 import { PresetMenu } from "./PresetMenu";
 import { Knob } from "./Knob";
-import type { ChannelView } from "../dsp/bands";
 import type { Snapshot } from "../state/presets";
 import Logo from "../assets/logo.svg";
 
@@ -13,8 +12,6 @@ interface Props {
    * has nothing to put here.
    */
   extras?: ReactNode;
-  channelView: ChannelView;
-  dbRange: number;
   outputGain: number;
   bypassed: boolean;
   slot: "A" | "B";
@@ -23,22 +20,10 @@ interface Props {
   onLoadSnapshot: (snap: Snapshot, name: string) => void;
   onSwitchSlot: () => void;
   onCopyToOther: () => void;
-  onChannelView: (v: ChannelView) => void;
-  onDbRange: (r: number) => void;
   onOutputGain: (g: number) => void;
   onBypass: (b: boolean) => void;
   onReset: () => void;
 }
-
-const RANGES = [6, 12, 18, 30];
-
-const VIEWS: { value: ChannelView; label: string }[] = [
-  { value: "all", label: "Stereo" },
-  { value: "left", label: "Left" },
-  { value: "right", label: "Right" },
-  { value: "mid", label: "Mid" },
-  { value: "side", label: "Side" },
-];
 
 function Divider() {
   return <div className="h-5 w-px shrink-0 bg-white/12" />;
@@ -58,8 +43,6 @@ function trackSheen(ev: React.PointerEvent<HTMLElement>) {
 
 export function Header({
   extras,
-  channelView,
-  dbRange,
   outputGain,
   bypassed,
   slot,
@@ -68,8 +51,6 @@ export function Header({
   onLoadSnapshot,
   onSwitchSlot,
   onCopyToOther,
-  onChannelView,
-  onDbRange,
   onOutputGain,
   onBypass,
   onReset,
@@ -125,28 +106,8 @@ export function Header({
 
       <PresetMenu getSnapshot={getSnapshot} onLoad={onLoadSnapshot} />
 
-      {/* view options */}
+      {/* View and Range live over the top-left of the plot — see ViewOverlay. */}
       <div className="ml-auto flex shrink-0 items-center gap-2.5">
-        <Dropdown
-          label="View"
-          value={channelView}
-          options={VIEWS.map((v) => ({ value: v.value, label: v.label }))}
-          onChange={(v) => onChannelView(v as ChannelView)}
-          align="end"
-        />
-        <Dropdown
-          label="Range"
-          value={String(dbRange)}
-          options={RANGES.map((r) => ({
-            value: String(r),
-            label: `± ${r} dB`,
-          }))}
-          onChange={(v) => onDbRange(Number(v))}
-          align="end"
-        />
-
-        <Divider />
-
         {/* output gain */}
         {/* Built from the pill primitives rather than CONTROL — this one needs its
             own padding and no gap, and Tailwind conflicts don't resolve by order. */}

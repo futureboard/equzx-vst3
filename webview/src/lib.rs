@@ -1,12 +1,12 @@
 use baseview::{
     Event, Size, Window, WindowEvent, WindowHandle, WindowInfo, WindowOpenOptions, WindowScalePolicy,
 };
-use nih_plug::prelude::{Editor, GuiContext, ParamSetter};
+use nih_plug::prelude::{AtomicF32, Editor, GuiContext, ParamSetter};
 use serde_json::Value;
 use std::{
     borrow::Cow,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -33,8 +33,15 @@ type CustomProtocolHandler =
 
 pub struct WebViewEditor {
     source: Arc<HTMLSource>,
+    /// Logical pixels throughout — see [`Editor::size`] for the one place that
+    /// is converted, and why.
     width: Arc<AtomicU32>,
     height: Arc<AtomicU32>,
+    /// Display scale the window is actually being drawn at.
+    scale: Arc<AtomicF32>,
+    /// Whether the host told us that scale itself. If it did, the wrapper is
+    /// already multiplying our reported size by it and we must not do so too.
+    host_scales: Arc<AtomicBool>,
     event_loop_handler: Arc<EventLoopHandler>,
     keyboard_handler: Arc<KeyboardHandler>,
     mouse_handler: Arc<MouseHandler>,
@@ -56,6 +63,8 @@ impl WebViewEditor {
             source: Arc::new(source),
             width,
             height,
+            scale: Arc::new(AtomicF32::new(1.0)),
+            host_scales: Arc::new(AtomicBool::new(false)),
             developer_mode: false,
             background_color: (255, 255, 255, 255),
             event_loop_handler: Arc::new(|_, _, _| {}),
@@ -120,6 +129,15 @@ pub struct WindowHandler {
     events_receiver: Receiver<Value>,
     pub width: Arc<AtomicU32>,
     pub height: Arc<AtomicU32>,
+    scale: Arc<AtomicF32>,
+    /// The size [`Self::resize`] last asked for, packed, or zero once it has
+    /// been answered. Only a size that answers a request can be said to have
+    /// overridden one — a window settling on open, or a host resizing its own
+    /// frame, is not the host disagreeing with us.
+    pending: AtomicU64,
+    /// Last override that was logged, so a drag the host is clamping reports
+    /// once rather than once a frame.
+    last_mismatch: AtomicU64,
 }
 
 impl WindowHandler {
@@ -148,6 +166,8 @@ impl WindowHandler {
         }
         self.width.store(width, Ordering::Relaxed);
         self.height.store(height, Ordering::Relaxed);
+        self.pending
+            .store(((width as u64) << 32) | height as u64, Ordering::Relaxed);
 
         // Both of these are deferred: every wrapper posts `request_resize` to a
         // queue, and baseview runs the resize at the end of the current window
@@ -171,12 +191,72 @@ impl WindowHandler {
     /// any display not at 100%.
     fn stretch_webview(&self, info: &WindowInfo) {
         let size = info.physical_size();
+
+        // The DPI fix, in one line.
+        //
+        // WebView2 renders a CSS pixel as a physical one — `devicePixelRatio`
+        // is 1 no matter what the display is doing — so on a scaled display the
+        // page laid out at physical size while everything around it worked in
+        // logical pixels. Every size then disagreed with every other by exactly
+        // the scale factor: ask a DPI-aware host for a 1400x900 editor at 150%
+        // and roughly 900x600 of UI is what comes back.
+        //
+        // Zooming the webview by the display's scale makes a CSS pixel and a
+        // logical pixel the same size again, which is the assumption the rest of
+        // this file, the UI, and the host all already shared.
+        let scale = info.scale() as f32;
+        if (self.scale.load(Ordering::Relaxed) - scale).abs() > f32::EPSILON {
+            self.scale.store(scale, Ordering::Relaxed);
+            self.webview.zoom(scale as f64);
+        }
+
+        // Whoever owns the frame has the last word on how big it is. A host may
+        // refuse a size outright, clamp it to the display, or apply a scale of
+        // its own, and when it does, the size we asked for is fiction: reporting
+        // it back through `Editor::size` would have us arguing with the host on
+        // every subsequent resize, and would persist a size the user never got.
+        // Adopt what actually happened instead — in logical pixels, which is
+        // what everything outside this function deals in.
+        let logical = info.logical_size();
+        let (got_w, got_h) = (logical.width.round() as u32, logical.height.round() as u32);
+        self.width.store(got_w, Ordering::Relaxed);
+        self.height.store(got_h, Ordering::Relaxed);
+
+        let pending = self.pending.swap(0, Ordering::Relaxed);
+        let asked = ((pending >> 32) as u32, pending as u32);
+        if pending != 0 && asked != (got_w, got_h) {
+            // Only when it changes, or a drag would log sixty times a second.
+            let seen = ((got_w as u64) << 32) | got_h as u64;
+            if self.last_mismatch.swap(seen, Ordering::Relaxed) != seen {
+                nih_plug::nih_log!(
+                    "nih_plug_webview: host sized the editor to {}x{} logical \
+                     ({}x{} physical at {}x scale), {}x{} was requested",
+                    got_w,
+                    got_h,
+                    size.width,
+                    size.height,
+                    scale,
+                    asked.0,
+                    asked.1
+                );
+            }
+        }
+
         self.webview.set_bounds(wry::Rect {
             x: 0,
             y: 0,
             width: size.width,
             height: size.height,
         });
+    }
+
+    /// The display scale the editor is being drawn at, 1.0 at 100%.
+    ///
+    /// The UI needs this to reason about the screen: `window.screen` reports
+    /// device pixels whatever the webview's zoom is, while every size the UI
+    /// works in is logical.
+    pub fn scale(&self) -> f32 {
+        self.scale.load(Ordering::Relaxed)
     }
 
     pub fn send_json(&self, json: Value) {
@@ -319,24 +399,11 @@ impl Editor for WebViewEditor {
         context: Arc<dyn GuiContext>,
     ) -> Box<dyn std::any::Any + Send> {
         let options = WindowOpenOptions {
-            // Added to the vendored copy.
-            //
-            // The webview is not DPI-aware on these platforms — WebView2 reports
-            // a `devicePixelRatio` of 1 and renders CSS pixels as physical ones,
-            // which is why `set_scale_factor` below refuses the host's scale
-            // factor outright. Letting baseview apply the *system* scale anyway
-            // made the two disagree by exactly that factor: at 150% the window
-            // opened half again as large as the webview inside it, so a third of
-            // it was bare background, and every size the UI asked for came back
-            // 1.5x too big — a resize grip that overshot, and a persisted size
-            // that grew by half on every reopen.
-            //
-            // macOS is left alone: WKWebView does handle scaling, so there the
-            // system factor is the right one.
-            #[cfg(target_os = "macos")]
+            // Sizes here and everywhere else in this file are logical pixels;
+            // baseview turns them into physical ones using the display's scale,
+            // and [`WindowHandler::stretch_webview`] zooms the webview to match
+            // so a CSS pixel and a logical pixel stay the same thing.
             scale: WindowScalePolicy::SystemScaleFactor,
-            #[cfg(not(target_os = "macos"))]
-            scale: WindowScalePolicy::ScaleFactor(1.0),
             size: Size {
                 width: self.width.load(Ordering::Relaxed) as f64,
                 height: self.height.load(Ordering::Relaxed) as f64,
@@ -346,6 +413,7 @@ impl Editor for WebViewEditor {
 
         let width = self.width.clone();
         let height = self.height.clone();
+        let scale = self.scale.clone();
         let developer_mode = self.developer_mode;
         let source = self.source.clone();
         let background_color = self.background_color;
@@ -410,21 +478,54 @@ impl Editor for WebViewEditor {
                 mouse_handler,
                 width,
                 height,
+                scale,
+                pending: AtomicU64::new(0),
+                last_mismatch: AtomicU64::new(0),
             }
         });
         return Box::new(Instance { window_handle });
     }
 
+    /// The editor's size, in whichever units this host is going to read it in.
+    ///
+    /// A wrapper multiplies whatever comes back by the scale factor the plugin
+    /// accepted — so when the host told us its scale, logical is the right
+    /// answer and the wrapper does the rest. Hosts that never call
+    /// `set_scale_factor` leave that multiplier at one (nih-plug's own notes
+    /// name Ableton Live), and reporting logical to one of those asks for a
+    /// window a scale factor too small. So do the multiplication here instead,
+    /// exactly when nobody else is going to.
     fn size(&self) -> (u32, u32) {
-        (
+        let (width, height) = (
             self.width.load(Ordering::Relaxed),
             self.height.load(Ordering::Relaxed),
+        );
+        if self.host_scales.load(Ordering::Relaxed) {
+            return (width, height);
+        }
+        let scale = self.scale.load(Ordering::Relaxed);
+        (
+            (width as f32 * scale).round() as u32,
+            (height as f32 * scale).round() as u32,
         )
     }
 
-    fn set_scale_factor(&self, _factor: f32) -> bool {
-        // TODO: implement for Windows and Linux
-        return false;
+    /// Accept the host's scale factor.
+    ///
+    /// Refusing it, as this used to, does not make the problem go away — it
+    /// just moves the scaling somewhere the plugin has no say over, and leaves
+    /// the wrapper reporting sizes a scale factor out from the window that
+    /// actually exists. The webview is zoomed to match in `stretch_webview`.
+    ///
+    /// macOS is the exception: there the OS scales the window and every size in
+    /// the API is already logical, so there is nothing to apply.
+    fn set_scale_factor(&self, factor: f32) -> bool {
+        if cfg!(target_os = "macos") || !factor.is_finite() || factor <= 0.0 {
+            return false;
+        }
+        self.scale.store(factor, Ordering::Relaxed);
+        self.host_scales.store(true, Ordering::Relaxed);
+        true
     }
 
     fn param_values_changed(&self) {}

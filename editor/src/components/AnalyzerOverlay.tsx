@@ -25,8 +25,9 @@ const SMOOTHING = [
 
 /**
  * Analyser controls, parked over the top-right of the plot instead of in the
- * header — they describe the spectrum, so they belong next to it. Held at
- * reduced opacity until pointed at, so they don't compete with the curve.
+ * header — they describe the spectrum, so they belong next to it. The pane
+ * frosts whatever the analyser is drawing behind it while its own contents sit
+ * back until pointed at, so it never competes with the curve.
  */
 export function AnalyzerOverlay({
   analyzerMode,
@@ -35,7 +36,7 @@ export function AnalyzerOverlay({
   onSpectrumSmoothing,
 }: Props) {
   return (
-    <div className="glass flex items-center gap-1.5 rounded-full p-1 opacity-55 transition-opacity duration-200 hover:opacity-100 focus-within:opacity-100">
+    <div className="glass glass-overlay flex items-center gap-1.5 rounded-full p-1">
       <Dropdown
         label="Analyzer"
         value={analyzerMode}

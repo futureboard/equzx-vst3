@@ -192,6 +192,10 @@ pub struct StateMessage {
     pub bypass: bool,
     pub sample_rate: f32,
     pub max_bands: usize,
+    /// Display scale the editor is drawn at. The UI works in logical pixels,
+    /// but `window.screen` reports device ones, so it needs this to tell how
+    /// large a window the display can actually hold.
+    pub scale: f32,
     pub resonance: ResonanceState,
     /// Whatever the UI last asked to persist, verbatim.
     pub ui: String,
@@ -235,7 +239,12 @@ pub fn encode_reduction(curve: &[f32]) -> String {
 }
 
 /// Read the parameters into the shape the UI expects.
-pub fn state_message(params: &EquzxParams, ui: String, sample_rate: f32) -> StateMessage {
+pub fn state_message(
+    params: &EquzxParams,
+    ui: String,
+    sample_rate: f32,
+    scale: f32,
+) -> StateMessage {
     let mut bands = Vec::with_capacity(MAX_BANDS);
     for (slot, p) in params.bands.iter().enumerate() {
         if !p.active.value() {
@@ -268,6 +277,7 @@ pub fn state_message(params: &EquzxParams, ui: String, sample_rate: f32) -> Stat
         bypass: params.bypass.value(),
         sample_rate,
         max_bands: MAX_BANDS,
+        scale,
         resonance: ResonanceState {
             enabled: res.enabled.value(),
             // The three ratios are held 0..1 and read 0..100 on the wire.
@@ -488,7 +498,7 @@ mod tests {
     #[test]
     fn a_default_state_message_serializes_with_no_bands() {
         let params = EquzxParams::default();
-        let msg = state_message(&params, "{}".into(), 48_000.0);
+        let msg = state_message(&params, "{}".into(), 48_000.0, 1.0);
         assert!(msg.bands.is_empty());
         assert_eq!(msg.max_bands, MAX_BANDS);
 
@@ -501,7 +511,7 @@ mod tests {
     #[test]
     fn the_resonance_state_reads_back_in_the_units_the_ui_shows() {
         let params = EquzxParams::default();
-        let res = state_message(&params, String::new(), 48_000.0).resonance;
+        let res = state_message(&params, String::new(), 48_000.0, 1.0).resonance;
         // Off out of the box, and the ratios are percentages on the wire.
         assert!(!res.enabled);
         assert_eq!(res.depth, 50.0);
