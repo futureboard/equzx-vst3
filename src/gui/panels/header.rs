@@ -150,27 +150,30 @@ pub fn show(
 fn output_gain(ui: &mut Ui, frame: &Frame) {
     let value = frame.params.output_gain.value();
     let format = |v: f32| format!("{}{:.1} dB", if v > 0.0 { "+" } else { "" }, v);
-    let knob = Knob::new("Out", value, -24.0, 12.0, &format)
-        .default_value(0.0)
-        .size(22.0)
-        .inline(true);
+
+    // Allocated rather than read off the cursor: this sits inside the header's
+    // right-to-left group, where the cursor's left edge is negative infinity
+    // because the layout has not yet decided how far left the run reaches.
+    let (rect, response) = ui.allocate_exact_size(vec2(104.0, PILL_HEIGHT), Sense::hover());
 
     // A pill drawn round the dial, rather than the dial drawn inside a button:
     // the plate has to be down before the knob paints over it.
-    let width = 100.0;
-    let rect = Rect::from_min_size(ui.cursor().min, vec2(width, PILL_HEIGHT));
     chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, Fill::Quiet, false);
 
     let mut inner = ui.new_child(
         nih_plug_egui::egui::UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(6.0, 2.0)))
+            .max_rect(rect.shrink2(vec2(7.0, 2.0)))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    if let Some(v) = knob.show(&mut inner) {
+    if let Some(v) = Knob::new("Out", value, -24.0, 12.0, &format)
+        .default_value(0.0)
+        .size(22.0)
+        .inline(true)
+        .show(&mut inner)
+    {
         edit::set_float(frame.setter, &frame.params.output_gain, v);
     }
-    ui.allocate_rect(rect, Sense::hover())
-        .on_hover_text("Output gain — drag the knob, double-click to reset");
+    response.on_hover_text("Output gain — drag the knob, double-click to reset");
 }
 
 fn bypass_button(ui: &mut Ui, bypassed: bool) -> nih_plug_egui::egui::Response {
