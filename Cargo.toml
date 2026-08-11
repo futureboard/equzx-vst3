@@ -8,7 +8,7 @@ license = "proprietary"
 description = "EQUZX — dynamic mid/side parametric EQ"
 
 [workspace]
-members = ["xtask", "webview"]
+members = ["xtask"]
 
 [lib]
 # `cdylib` is the plugin itself; `lib` keeps the DSP unit-testable.
@@ -16,13 +16,34 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
-# Vendored — see `webview/README.md` for why it isn't pulled from git.
-nih_plug_webview = { path = "webview" }
+# The editor. OpenGL-backed egui via baseview — every panel, curve and meter is
+# tessellated once and drawn by the GPU.
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+# The same renderer `nih_plug_egui` draws through, taken as a direct dependency
+# so the UI can hand egui a `PaintCallback` and run its own GLSL — see
+# `src/gui/gpu.rs`. Cargo unifies this with the copy `egui-baseview` pulls in,
+# which is what makes the callback downcast on the other side succeed. No
+# features: the only one that looks relevant, `x11`, is `winit?/x11`, and this
+# build has no winit for it to apply to.
+egui_glow = "0.31"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 realfft = "3.3"
-include_dir = "0.7"
-base64 = "0.22"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Not used directly — declared to switch on one feature of the copy
+# `nih_plug_egui` already depends on, which is why the source and revision have
+# to match its own to the letter.
+#
+# Windows drops keyboard input into a plugin window in some hosts, and the
+# upstream workaround is to re-focus the window whenever egui reports that a
+# widget took focus or changed. That is a handful of events per interaction, not
+# per frame, and this UI now has a text field and five single-key shortcuts
+# riding on keyboard input that the webview used to receive through the browser.
+# See https://github.com/BillyDM/egui-baseview/issues/20.
+egui-baseview = { git = "https://github.com/BillyDM/egui-baseview.git", rev = "ec70c3fe6b2f070dcacbc22924431edbe24bd1c0", features = [
+  "windows_keyboard_workaround",
+] }
 
 [profile.release]
 lto = "thin"

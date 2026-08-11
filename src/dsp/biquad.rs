@@ -1,9 +1,9 @@
 //! Biquad coefficients and a transposed-direct-form-II section.
 //!
-//! The formulas are the RBJ cookbook set used by the Web Audio API, matched
-//! term for term with `editor/src/dsp/biquad.ts`. That is deliberate: the UI
-//! draws its curve from the TypeScript version while the audio runs through
-//! this one, so any drift between them would show up as a curve that lies.
+//! The formulas are the RBJ cookbook set. The display draws its curve from these
+//! same coefficients — see [`crate::gui::curves`], which evaluates them over a
+//! precomputed frequency grid — so the shape on screen is the shape being
+//! applied rather than a second implementation that could drift from it.
 
 use std::f32::consts::PI;
 

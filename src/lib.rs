@@ -12,12 +12,10 @@ use std::sync::Arc;
 use nih_plug::prelude::*;
 
 pub mod analyzer;
-pub mod assets;
 pub mod dsp;
-pub mod editor;
+pub mod gui;
 pub mod meters;
 pub mod params;
-pub mod protocol;
 pub mod version;
 
 use crate::analyzer::Taps;
@@ -88,13 +86,13 @@ impl Plugin for Equzx {
     }
 
     fn editor(&mut self, _executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
-        Some(Box::new(editor::create(editor::EditorContext {
+        gui::create(gui::EditorContext {
             params: self.params.clone(),
             transient: self.transient.clone(),
             taps: self.taps.clone(),
             meters: self.meters.clone(),
             sample_rate: self.sample_rate.clone(),
-        })))
+        })
     }
 
     fn initialize(
@@ -227,9 +225,7 @@ nih_export_vst3!(Equzx);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyzer::{Analyzer, CEIL_DB, FLOOR_DB, F_MIN, LOG_POINTS};
-    use base64::engine::general_purpose::STANDARD_NO_PAD;
-    use base64::Engine as _;
+    use crate::analyzer::{Analyzer, FLOOR_DB, F_MIN, LOG_POINTS};
     use std::f32::consts::PI;
 
     const SR: f32 = 48_000.0;
@@ -293,15 +289,6 @@ mod tests {
         fn set_current_voice_capacity(&self, _capacity: u32) {}
     }
 
-    fn decode(b64: &str) -> Vec<f32> {
-        STANDARD_NO_PAD
-            .decode(b64)
-            .unwrap()
-            .into_iter()
-            .map(|b| FLOOR_DB + (b as f32 / 255.0) * (CEIL_DB - FLOOR_DB))
-            .collect()
-    }
-
     /// Index of the log-spaced point nearest a frequency.
     fn point_for(freq: f32) -> usize {
         let f_max = crate::analyzer::F_MAX.min(SR / 2.0 - 1.0);
@@ -357,16 +344,11 @@ mod tests {
 
         let mut analyzer = Analyzer::new(SR);
         // Frames are smoothed against each other, so let the curve settle.
-        let mut pre = String::new();
-        let mut post = String::new();
         for _ in 0..40 {
-            let frame = analyzer.analyze(&plugin.taps);
-            pre = frame.0;
-            post = frame.1;
+            analyzer.analyze(&plugin.taps);
         }
 
-        let pre_curve = decode(&pre);
-        let post_curve = decode(&post);
+        let (pre_curve, post_curve) = analyzer.curves();
         let peak = point_for(1000.0);
 
         assert!(
@@ -410,9 +392,8 @@ mod tests {
         for _ in 0..40 {
             analyzer.analyze(&plugin.taps);
         }
-        let curve = decode(&analyzer.analyze(&plugin.taps).0);
         assert!(
-            curve.iter().all(|db| *db <= FLOOR_DB + 0.5),
+            analyzer.curves().0.iter().all(|db| *db <= FLOOR_DB),
             "history survived a reset"
         );
     }

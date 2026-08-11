@@ -60,18 +60,6 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      # The UI is compiled into the plugin binary, so it has to exist first —
-      # otherwise `build.rs` bakes in its "UI not built" placeholder.
-      - name: Build the editor
-        working-directory: editor
-        run: |
-          bun install --frozen-lockfile
-          bun run build
-
       - name: Test
         if: matrix.test
         run: cargo test --workspace

@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
 use nih_plug::prelude::*;
+use nih_plug_egui::EguiState;
 
-/// Matches `MAX_BANDS` in `editor/src/dsp/bands.ts`.
+/// Matches `MAX_BANDS` in `crate::gui::state`.
 pub const MAX_BANDS: usize = 24;
 
 /// dB past the threshold at which a dynamic band reaches its full range.
@@ -237,7 +238,7 @@ impl DynMode {
     }
 }
 
-/// One band slot. Ranges match `sanitizeBand` in `editor/src/state/presets.ts`,
+/// One band slot. Ranges match `BandSnapshot::sanitized` in `crate::gui::state`,
 /// so a preset written by the UI always round-trips through the parameters.
 #[derive(Params)]
 pub struct BandParams {
@@ -536,6 +537,14 @@ pub struct EquzxParams {
     /// dB range, panel height, the parked A/B slot. Opaque JSON owned by the UI.
     #[persist = "ui"]
     pub ui_state: Arc<RwLock<String>>,
+
+    /// Window size, so a reopened editor comes back the size it was left.
+    ///
+    /// Held by the egui adapter rather than written into `ui_state` with the
+    /// rest: the editor has to know how large to open *before* any of its own
+    /// state has been read.
+    #[persist = "editor"]
+    pub editor_state: Arc<EguiState>,
 }
 
 impl Default for EquzxParams {
@@ -561,6 +570,10 @@ impl Default for EquzxParams {
             bands: std::array::from_fn(|_| BandParams::default()),
             resonance: ResonanceParams::default(),
             ui_state: Arc::new(RwLock::new(String::new())),
+            editor_state: EguiState::from_size(
+                crate::gui::DEFAULT_WIDTH,
+                crate::gui::DEFAULT_HEIGHT,
+            ),
         }
     }
 }

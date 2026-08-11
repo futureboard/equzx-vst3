@@ -4,17 +4,15 @@
 //! pulls the most recent window out of it, runs an FFT, and reduces the result
 //! to a log-spaced curve.
 //!
-//! Reducing on this side is the whole point. A raw 8192-point FFT is 4096 bins,
-//! and pushing that through the webview's `evaluate_script` bridge sixty times a
-//! second would cost megabytes per second of JSON. The display is logarithmic
-//! anyway, so [`LOG_POINTS`] log-spaced values carry everything it can draw —
-//! quantised to a byte each and base64'd, one frame of both curves is about
-//! 1.4 kB.
+//! Reducing on this side is still worth doing even now the editor is in the same
+//! process as the analyser. A raw 8192-point FFT is 4096 bins, most of them
+//! crowded into the top octave of a logarithmic display; [`LOG_POINTS`]
+//! log-spaced values carry everything that display can draw, and the reduction
+//! is the part that has to know about bin spacing. The UI reads the result in
+//! place — see [`Analyzer::curves`].
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use base64::engine::general_purpose::STANDARD_NO_PAD;
-use base64::Engine as _;
 use realfft::{num_complex::Complex32, RealFftPlanner, RealToComplex};
 use std::sync::Arc;
 
@@ -115,7 +113,6 @@ struct Channel {
     /// Smoothed magnitudes, carried between frames.
     mags: Vec<f32>,
     curve: Vec<f32>,
-    bytes: Vec<u8>,
 }
 
 impl Channel {
@@ -125,7 +122,6 @@ impl Channel {
             spectrum: fft.make_output_vec(),
             mags: vec![0.0; FFT_SIZE / 2 + 1],
             curve: vec![FLOOR_DB; LOG_POINTS],
-            bytes: vec![0; LOG_POINTS],
         }
     }
 }
@@ -206,14 +202,19 @@ impl Analyzer {
             .collect();
     }
 
-    /// Analyse both taps and return the two base64 curves, pre first.
-    pub fn analyze(&mut self, taps: &Taps) -> (String, String) {
-        let pre = self.analyze_one(&taps.pre, true);
-        let post = self.analyze_one(&taps.post, false);
-        (pre, post)
+    /// Analyse both taps. The curves are left in place for [`Self::curves`].
+    pub fn analyze(&mut self, taps: &Taps) {
+        self.analyze_one(&taps.pre, true);
+        self.analyze_one(&taps.post, false);
     }
 
-    fn analyze_one(&mut self, ring: &SampleRing, is_pre: bool) -> String {
+    /// The most recent pair of curves, pre first. [`LOG_POINTS`] dB values each,
+    /// log-spaced from [`F_MIN`] to [`Self::f_max`].
+    pub fn curves(&self) -> (&[f32], &[f32]) {
+        (&self.pre.curve, &self.post.curve)
+    }
+
+    fn analyze_one(&mut self, ring: &SampleRing, is_pre: bool) {
         ring.read_latest(&mut self.scratch);
 
         let channel = if is_pre {
@@ -237,7 +238,7 @@ impl Analyzer {
             .process(&mut channel.windowed, &mut channel.spectrum)
             .is_err()
         {
-            return String::new();
+            return;
         }
 
         // Referenced so that a full-scale sine reads 0 dBFS: a tone of amplitude A
@@ -251,12 +252,6 @@ impl Analyzer {
         }
 
         log_reduce(&channel.mags, &self.bin_pos, &mut channel.curve);
-
-        for (byte, db) in channel.bytes.iter_mut().zip(channel.curve.iter()) {
-            let t = ((db - FLOOR_DB) / (CEIL_DB - FLOOR_DB)).clamp(0.0, 1.0);
-            *byte = (t * 255.0 + 0.5) as u8;
-        }
-        STANDARD_NO_PAD.encode(&channel.bytes)
     }
 }
 
@@ -315,15 +310,6 @@ mod tests {
         }
     }
 
-    fn decode(b64: &str) -> Vec<f32> {
-        STANDARD_NO_PAD
-            .decode(b64)
-            .unwrap()
-            .into_iter()
-            .map(|b| FLOOR_DB + (b as f32 / 255.0) * (CEIL_DB - FLOOR_DB))
-            .collect()
-    }
-
     /// Index of the output point nearest a frequency.
     fn point_for(freq: f32, sr: f32) -> usize {
         let f_max = F_MAX.min(sr / 2.0 - 1.0);
@@ -353,11 +339,10 @@ mod tests {
         let mut analyzer = Analyzer::new(sr);
 
         // Smoothing means the first frames only get part of the way there.
-        let mut pre = String::new();
         for _ in 0..40 {
-            pre = analyzer.analyze(&taps).0;
+            analyzer.analyze(&taps);
         }
-        let curve = decode(&pre);
+        let curve = analyzer.curves().0;
 
         let peak_idx = curve
             .iter()
@@ -370,12 +355,9 @@ mod tests {
             (peak_idx as i32 - expected as i32).abs() <= 3,
             "peak landed at point {peak_idx}, expected near {expected}"
         );
-        // A full-scale sine should read close to 0 dBFS, i.e. clamp at the ceiling.
-        assert!(
-            curve[peak_idx] > CEIL_DB - 1.0,
-            "peak was {} dB",
-            curve[peak_idx]
-        );
+        // A full-scale sine reads 0 dBFS — that is what the window correction
+        // in `analyze_one` is for.
+        assert!(curve[peak_idx] > -1.0, "peak was {} dB", curve[peak_idx]);
         // Two octaves below, there is nothing.
         assert!(curve[point_for(250.0, sr)] < -60.0);
     }
@@ -390,15 +372,14 @@ mod tests {
 
         let mut a = Analyzer::new(sr);
         let mut b = Analyzer::new(sr);
-        let (mut loud_curve, mut quiet_curve) = (String::new(), String::new());
         for _ in 0..40 {
-            loud_curve = a.analyze(&loud).0;
-            quiet_curve = b.analyze(&quiet).0;
+            a.analyze(&loud);
+            b.analyze(&quiet);
         }
 
         let idx = point_for(1000.0, sr);
-        let l = decode(&loud_curve)[idx];
-        let q = decode(&quiet_curve)[idx];
+        let l = a.curves().0[idx];
+        let q = b.curves().0[idx];
         assert!(q < l - 30.0, "loud {l} dB vs quiet {q} dB");
     }
 
@@ -406,17 +387,18 @@ mod tests {
     fn silence_sits_on_the_floor() {
         let taps = Taps::default();
         let mut analyzer = Analyzer::new(48_000.0);
-        let curve = decode(&analyzer.analyze(&taps).0);
-        assert!(curve.iter().all(|&db| db <= FLOOR_DB + 0.5));
+        analyzer.analyze(&taps);
+        assert!(analyzer.curves().0.iter().all(|&db| db <= FLOOR_DB));
     }
 
     #[test]
     fn the_curve_is_the_advertised_size() {
         let taps = Taps::default();
         let mut analyzer = Analyzer::new(44_100.0);
-        let (pre, post) = analyzer.analyze(&taps);
-        assert_eq!(decode(&pre).len(), LOG_POINTS);
-        assert_eq!(decode(&post).len(), LOG_POINTS);
+        analyzer.analyze(&taps);
+        let (pre, post) = analyzer.curves();
+        assert_eq!(pre.len(), LOG_POINTS);
+        assert_eq!(post.len(), LOG_POINTS);
     }
 
     #[test]
