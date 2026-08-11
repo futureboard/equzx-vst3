@@ -8,7 +8,7 @@ license = "proprietary"
 description = "EQUZX — dynamic mid/side parametric EQ"
 
 [workspace]
-members = ["xtask", "webview"]
+members = ["xtask"]
 
 [lib]
 # `cdylib` is the plugin itself; `lib` keeps the DSP unit-testable.
@@ -16,13 +16,17 @@ crate-type = ["cdylib", "lib"]
 
 [dependencies]
 nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
-# Vendored — see `webview/README.md` for why it isn't pulled from git.
-nih_plug_webview = { path = "webview" }
+# The editor. OpenGL-backed egui via baseview — every panel, curve and meter is
+# tessellated once and drawn by the GPU.
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+# The same renderer `nih_plug_egui` draws through, taken as a direct dependency
+# so the UI can hand egui a `PaintCallback` and run its own GLSL — see
+# `src/gui/gpu.rs`. Cargo unifies this with the copy `egui-baseview` pulls in,
+# which is what makes the callback downcast on the other side succeed.
+egui_glow = { version = "0.31", features = ["x11"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 realfft = "3.3"
-include_dir = "0.7"
-base64 = "0.22"
 
 [profile.release]
 lto = "thin"

@@ -2,9 +2,9 @@
 //!
 //! Two pieces. [`LevelDetector`] answers "how loud is this band's slice of the
 //! signal right now"; [`dynamic_step`] turns that answer into an engagement and
-//! a gain offset. The second half is ported from `editor/src/dsp/dynamics.ts`
-//! so the UI's prediction of where a dynamic band sits matches what the audio
-//! thread actually does.
+//! a gain offset. The offset is published through [`crate::meters`], which is
+//! what lets the display draw a dynamic band where it actually sits rather than
+//! predicting it — the UI reads the audio thread's own answer.
 
 use crate::params::{DynMode, DYN_KNEE_DB};
 
