@@ -12,9 +12,7 @@ pub mod resonance;
 
 use std::sync::Arc;
 
-use nih_plug_egui::egui::{
-    vec2, Align, Align2, Area, Context, Id, Layout, Order, Pos2, Rect, Sense, Ui, UiBuilder, Vec2,
-};
+use nih_plug_egui::egui::{self, vec2, Align2, Area, Context, Id, Margin, Order, Pos2, Rect, Ui, Vec2};
 
 use crate::gui::gpu::FxRenderer;
 use crate::gui::widgets::chrome;
@@ -96,36 +94,47 @@ impl Floating {
                 // The plate is reserved before the contents so the blur callback
                 // is earlier in the draw list than everything it sits under.
                 let slot = chrome::reserve_glass(ui);
-                let origin = ui.cursor().min;
 
-                // A generous ceiling rather than the screen: this is a floating
-                // panel, so `available_width` would be whatever is left of the
-                // window from its own corner.
-                let room = self.width.unwrap_or(4096.0) - self.padding.x * 2.0;
-                let layout = if self.horizontal {
-                    Layout::left_to_right(Align::Center)
-                } else {
-                    Layout::top_down(Align::Min)
-                };
-                let mut child = ui.new_child(
-                    UiBuilder::new()
-                        .max_rect(Rect::from_min_size(
-                            origin + self.padding,
-                            vec2(room.max(1.0), 4096.0),
-                        ))
-                        .layout(layout),
-                );
-                contents(&mut child);
-                let inner = child.min_rect();
+                // An `Area` hands its contents an unbounded rectangle, and two
+                // things here need a real edge to measure against: a
+                // right-to-left group works back from the right edge, and
+                // `INFINITY - INFINITY` is `NaN`, which propagates into the
+                // stored area rect and takes egui's own assertions down with it.
+                let bound = self
+                    .width
+                    .unwrap_or_else(|| ui.ctx().screen_rect().width());
+                ui.set_max_width(bound);
 
-                let mut rect = Rect::from_min_max(origin, inner.max + self.padding);
-                if let Some(width) = self.width {
-                    rect = Rect::from_min_size(origin, vec2(width, rect.height()));
-                }
+                // The panel is sized by what goes in it, so the contents go in
+                // egui's own auto-sizing containers and the frame reports what
+                // they came to. Handing a child `Ui` a tall `max_rect` to grow
+                // into instead is what broke this the first time round: a row
+                // centred on the cross axis reports a `min_rect` as tall as the
+                // space it was offered, so every panel measured the ceiling it
+                // had been given rather than its own height.
+                let frame = egui::Frame::NONE
+                    .inner_margin(Margin::symmetric(
+                        self.padding.x as i8,
+                        self.padding.y as i8,
+                    ))
+                    .show(ui, |ui| {
+                        // A fixed-width panel spans its width whatever is in it,
+                        // which is what lets the header push a group to the far
+                        // end of the bar.
+                        if self.width.is_some() {
+                            ui.set_min_width(bound - self.padding.x * 2.0);
+                        }
+                        if self.horizontal {
+                            ui.horizontal(|ui| contents(ui));
+                        } else {
+                            ui.vertical(|ui| contents(ui));
+                        }
+                    });
 
-                let response = ui.allocate_rect(rect, Sense::hover());
+                let rect = frame.response.rect;
                 let sheen = if self.sheen {
-                    response
+                    frame
+                        .response
                         .hover_pos()
                         .map(|p| Pos2::new(p.x - rect.min.x, p.y - rect.min.y))
                 } else {

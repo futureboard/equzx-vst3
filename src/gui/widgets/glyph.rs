@@ -154,6 +154,33 @@ pub fn resonance(rect: Rect, color: Color32, width: f32) -> Shape {
     ])
 }
 
+/// A rightward arrow.
+///
+/// Drawn rather than typed: egui's bundled fonts have no `→`, and a character
+/// the font cannot find comes out as an empty box. Anything in this UI that is
+/// really a symbol is a shape for that reason.
+pub fn arrow_right(rect: Rect, color: Color32, width: f32) -> Shape {
+    let c = rect.center();
+    let reach = rect.width() * 0.5;
+    let head = rect.height() * 0.25;
+    Shape::Vec(vec![
+        Shape::line_segment(
+            [Pos2::new(c.x - reach, c.y), Pos2::new(c.x + reach, c.y)],
+            Stroke::new(width, color),
+        ),
+        Shape::Path(nih_plug_egui::egui::epaint::PathShape {
+            points: vec![
+                Pos2::new(c.x + reach - head, c.y - head),
+                Pos2::new(c.x + reach, c.y),
+                Pos2::new(c.x + reach - head, c.y + head),
+            ],
+            closed: false,
+            fill: Color32::TRANSPARENT,
+            stroke: PathStroke::new(width, color),
+        }),
+    ])
+}
+
 /// A chevron, pointing down when closed and up when open.
 pub fn chevron(rect: Rect, open: bool, color: Color32) -> Shape {
     let c = rect.center();

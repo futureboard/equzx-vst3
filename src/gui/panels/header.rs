@@ -82,19 +82,9 @@ pub fn show(
             swap_slots(frame, ui_state);
         }
     }
-    let copy = chrome::pill(
-        ui,
-        &format!("{} → {}", ui_state.slot.label(), ui_state.slot.other().label()),
-        Fill::Quiet,
-    );
-    if copy.clicked() {
+    if copy_button(ui, ui_state.slot).clicked() {
         ui_state.parked = edit::capture(frame.params);
     }
-    copy.on_hover_text(format!(
-        "Copy slot {} into {}",
-        ui_state.slot.label(),
-        ui_state.slot.other().label()
-    ));
 
     preset_menu(ui, frame, fx, state, ui_state);
 
@@ -147,30 +137,69 @@ pub fn show(
     });
 }
 
+/// `A → B`, with the arrow drawn rather than typed — the bundled fonts have no
+/// arrow, and a missing glyph renders as an empty box.
+fn copy_button(ui: &mut Ui, slot: AbSlot) -> nih_plug_egui::egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(52.0, PILL_HEIGHT), Sense::click());
+    let fill = Fill::Quiet;
+    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, response.hovered());
+
+    let fg = fill.foreground(response.hovered());
+    let font = FontId::proportional(theme::SMALL);
+    ui.painter().text(
+        pos2(rect.min.x + 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        slot.label(),
+        font.clone(),
+        fg,
+    );
+    ui.painter().add(glyph::arrow_right(
+        Rect::from_center_size(rect.center(), vec2(14.0, 8.0)),
+        white(120),
+        1.4,
+    ));
+    ui.painter().text(
+        pos2(rect.max.x - 12.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        slot.other().label(),
+        font,
+        fg,
+    );
+
+    response.on_hover_text(format!(
+        "Copy slot {} into {}",
+        slot.label(),
+        slot.other().label()
+    ))
+}
+
 fn output_gain(ui: &mut Ui, frame: &Frame) {
     let value = frame.params.output_gain.value();
     let format = |v: f32| format!("{}{:.1} dB", if v > 0.0 { "+" } else { "" }, v);
-    let knob = Knob::new("Out", value, -24.0, 12.0, &format)
-        .default_value(0.0)
-        .size(22.0)
-        .inline(true);
+
+    // Allocated rather than read off the cursor: this sits inside the header's
+    // right-to-left group, where the cursor's left edge is negative infinity
+    // because the layout has not yet decided how far left the run reaches.
+    let (rect, response) = ui.allocate_exact_size(vec2(104.0, PILL_HEIGHT), Sense::hover());
 
     // A pill drawn round the dial, rather than the dial drawn inside a button:
     // the plate has to be down before the knob paints over it.
-    let width = 100.0;
-    let rect = Rect::from_min_size(ui.cursor().min, vec2(width, PILL_HEIGHT));
     chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, Fill::Quiet, false);
 
     let mut inner = ui.new_child(
         nih_plug_egui::egui::UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(6.0, 2.0)))
+            .max_rect(rect.shrink2(vec2(7.0, 2.0)))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    if let Some(v) = knob.show(&mut inner) {
+    if let Some(v) = Knob::new("Out", value, -24.0, 12.0, &format)
+        .default_value(0.0)
+        .size(22.0)
+        .inline(true)
+        .show(&mut inner)
+    {
         edit::set_float(frame.setter, &frame.params.output_gain, v);
     }
-    ui.allocate_rect(rect, Sense::hover())
-        .on_hover_text("Output gain — drag the knob, double-click to reset");
+    response.on_hover_text("Output gain — drag the knob, double-click to reset");
 }
 
 fn bypass_button(ui: &mut Ui, bypassed: bool) -> nih_plug_egui::egui::Response {

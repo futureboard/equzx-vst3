@@ -18,7 +18,31 @@ use crate::gui::widgets::menu::{self, Align};
 use crate::gui::widgets::glyph;
 use crate::gui::widgets::Knob;
 
+/// The switch and its chevron, as one control.
+///
+/// Laid out in a sub-`Ui` of its own because the header puts this inside a
+/// right-to-left group, and a pair drawn straight into that would come out in
+/// the order they were written — chevron first, then the switch it belongs to.
 pub fn show(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
+    let enabled = frame.params.resonance.enabled.value();
+    let width = SWITCH_WIDTH + if enabled { READOUT_WIDTH } else { 0.0 } + CHEVRON_WIDTH;
+    ui.allocate_ui_with_layout(
+        vec2(width, PILL_HEIGHT),
+        nih_plug_egui::egui::Layout::left_to_right(nih_plug_egui::egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            pair(ui, frame, fx);
+        },
+    );
+}
+
+/// Width of the switch, of the reduction read-out it grows by while armed, and
+/// of the chevron that completes the pill.
+const SWITCH_WIDTH: f32 = 58.0;
+const READOUT_WIDTH: f32 = 26.0;
+const CHEVRON_WIDTH: f32 = 22.0;
+
+fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
     let res = &frame.params.resonance;
     let enabled = res.enabled.value();
 
@@ -32,7 +56,7 @@ pub fn show(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
     } else {
         String::new()
     };
-    let width = 58.0 + if enabled { 26.0 } else { 0.0 };
+    let width = SWITCH_WIDTH + if enabled { READOUT_WIDTH } else { 0.0 };
     let (switch_rect, switch) = ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::click());
 
     let fill = if enabled { Fill::Armed } else { Fill::Quiet };
@@ -78,7 +102,7 @@ pub fn show(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
 
     // --- the chevron that opens the rest --------------------------------
     let id = Id::new("resonance-menu");
-    let anchor = menu::trigger(ui, id, 22.0, |ui, rect, _| {
+    let anchor = menu::trigger(ui, id, CHEVRON_WIDTH, |ui, rect, _| {
         ui.painter().add(glyph::chevron(
             rect,
             menu::is_open(ui, id),
