@@ -200,10 +200,7 @@ impl Display {
                     frame.spectrum_pre,
                     &axes,
                     ui_state.spectrum_smoothing,
-                    // Pre stays neutral grey; only the processed signal gets colour.
-                    Color32::from_rgba_unmultiplied(150, 150, 155, 36),
-                    Color32::from_rgba_unmultiplied(180, 180, 188, 77),
-                    true,
+                    SpectrumLayer::Pre,
                 );
             }
             if ui_state.analyzer_mode.draws_post() {
@@ -213,9 +210,7 @@ impl Display {
                     frame.spectrum_post,
                     &axes,
                     ui_state.spectrum_smoothing,
-                    fade(NEON, 0.13),
-                    fade(MOCHI, 0.55),
-                    false,
+                    SpectrumLayer::Post,
                 );
             }
 
@@ -223,15 +218,17 @@ impl Display {
             self.draw_curves(&clipped, &axes, bands, frame, bypassed, focus);
         }
 
-        // Bloom over the curves, before the handles and labels go down so the
-        // glow picks up the signal and not the typography.
+        // A restrained bloom over the curves, before the handles and labels go
+        // down so the glow picks up the signal and not the typography. The
+        // detailed edge light lives in the strokes now; this only lifts it.
         if !bypassed {
+            let tune = crate::gui::tune::get();
             ui.painter().add(frame.fx.bloom(
                 plot,
                 Bloom {
                     tint: Color32::from_rgb(0xff, 0xa8, 0xd0),
-                    intensity: 0.75,
-                    threshold: 0.42,
+                    intensity: 0.45 * tune.spectrum_glow,
+                    threshold: 0.52,
                     levels: 3,
                 },
             ));
@@ -243,7 +240,7 @@ impl Display {
 
         self.interact(ui, &axes, &background, frame, bands, ui_state, selected);
         self.draw_handles(ui, &axes, bands, frame, ui_state, *selected);
-        self.draw_readout(ui, &axes, bands, ui_state, *selected);
+        self.draw_readout(ui, &axes, bands, frame, ui_state, *selected);
     }
 
     fn draw_curves(
@@ -311,12 +308,28 @@ impl Display {
             0.22,
             0.02,
         ));
+        // Three strokes deep: a wide whisper, a pink inner glow, and the
+        // crisp pale core — analytic light rather than screen-wide bloom.
+        if !bypassed {
+            let glow = crate::gui::tune::get().spectrum_glow;
+            for (width, color) in [
+                (7.0, fade(NEON, 0.08 * glow)),
+                (3.2, fade(NEON, 0.26 * glow)),
+            ] {
+                painter.add(Shape::Path(PathShape {
+                    points: points.clone(),
+                    closed: false,
+                    fill: Color32::TRANSPARENT,
+                    stroke: PathStroke::new(width, color),
+                }));
+            }
+        }
         painter.add(Shape::Path(PathShape {
             points,
             closed: false,
             fill: Color32::TRANSPARENT,
             stroke: PathStroke::new(
-                2.0,
+                1.8,
                 if bypassed {
                     white(64)
                 } else {
@@ -595,6 +608,14 @@ impl Display {
                 },
                 Stroke::new(1.5, SURFACE_DEEP),
             );
+            // The catch-light a lacquered head takes, up and to the left.
+            if band.enabled {
+                painter.circle_filled(
+                    pos2(centre.x - radius * 0.32, centre.y - radius * 0.35),
+                    radius * 0.26,
+                    fade(Color32::WHITE, 0.30 * opacity),
+                );
+            }
             if band.dynamic && band.kind.uses_gain() {
                 painter.circle_stroke(centre, 10.0, Stroke::new(1.0, fade(color, 0.7 * opacity)));
             }
@@ -619,20 +640,23 @@ impl Display {
     }
 
     /// The floating read-out beside whichever band has the pointer.
+    #[allow(clippy::too_many_arguments)]
     fn draw_readout(
         &self,
         ui: &Ui,
         axes: &Axes,
         bands: &[BandView],
+        frame: &Frame,
         ui_state: &UiState,
         selected: Option<usize>,
     ) {
         let Some(slot) = self.hovered.or(selected) else {
             return;
         };
-        let Some(band) = bands
+        let Some((index, band)) = bands
             .iter()
-            .find(|b| b.slot == slot && b.in_view(ui_state.channel_view))
+            .enumerate()
+            .find(|(_, b)| b.slot == slot && b.in_view(ui_state.channel_view))
         else {
             return;
         };
@@ -687,13 +711,23 @@ impl Display {
             vec2(width, height),
         );
 
-        let painter = ui.painter();
-        painter.rect(
+        // The same glass family as the panels, in its smallest cut — the
+        // text has to stay sharp over whatever the spectrum is doing.
+        crate::gui::widgets::chrome::glass_panel(
+            ui,
+            frame.fx,
             rect,
-            theme::corner(8),
-            Color32::from_black_alpha(205),
-            Stroke::new(1.0, white(26)),
-            nih_plug_egui::egui::epaint::StrokeKind::Inside,
+            crate::gui::gpu::Glass::tooltip(),
+        );
+        let painter = ui.painter();
+        // The band's own colour, as a thin accent along the plate's left edge.
+        painter.rect_filled(
+            Rect::from_min_max(
+                pos2(rect.min.x + 1.0, rect.min.y + 5.0),
+                pos2(rect.min.x + 3.0, rect.max.y - 5.0),
+            ),
+            theme::corner(1),
+            fade(band_color(index), 0.85),
         );
         for (i, (text, color)) in lines.iter().enumerate() {
             painter.text(
@@ -753,7 +787,7 @@ fn draw_grid(painter: &nih_plug_egui::egui::Painter, axes: &Axes) {
                 Align2::CENTER_TOP,
                 fmt_freq(f),
                 font.clone(),
-                white(90),
+                white(115),
             );
         }
     }
@@ -775,25 +809,56 @@ fn draw_grid(painter: &nih_plug_egui::egui::Painter, axes: &Axes) {
                 format!("{db:.0}")
             },
             font.clone(),
-            white(82),
+            white(115),
         );
         db += step;
     }
 }
 
+/// Which of the two analyser traces is being drawn. They are deliberately not
+/// the same picture: the processed signal is the subject — gradient fill,
+/// bright detailed edge — and the input is its reference, a thin neutral line
+/// that never competes with it.
+#[derive(Clone, Copy, PartialEq)]
+enum SpectrumLayer {
+    Pre,
+    Post,
+}
+
+/// The EQUZX spectrum ramp, brightest at the curve and falling to a dark plum
+/// floor. Direction from the design constants; interpolated smoothly.
+const SPECTRUM_PEAK: Color32 = Color32::from_rgb(0xFF, 0xD5, 0xE9);
+const SPECTRUM_HIGH: Color32 = Color32::from_rgb(0xFF, 0x8B, 0xC2);
+const SPECTRUM_ROSE: Color32 = Color32::from_rgb(0xFF, 0x4F, 0x9B);
+const SPECTRUM_MID: Color32 = Color32::from_rgb(0xC5, 0x2F, 0x75);
+const SPECTRUM_LOW: Color32 = Color32::from_rgb(0x6F, 0x24, 0x4D);
+const SPECTRUM_FLOOR: Color32 = Color32::from_rgb(0x26, 0x13, 0x1E);
+
+/// The colour the spectrum's edge takes at a given normalised energy: quiet
+/// material sits in deep plum, the working range in the brand rose, and only
+/// genuine peaks approach the pale near-white. No rainbow — one hue, lit.
+fn energy_color(e: f32) -> Color32 {
+    let e = e.clamp(0.0, 1.0);
+    if e < 0.45 {
+        theme::mix(SPECTRUM_LOW, SPECTRUM_ROSE, e / 0.45)
+    } else if e < 0.80 {
+        theme::mix(SPECTRUM_ROSE, SPECTRUM_HIGH, (e - 0.45) / 0.35)
+    } else {
+        theme::mix(SPECTRUM_HIGH, SPECTRUM_PEAK, (e - 0.80) / 0.20)
+    }
+}
+
 /// One analyser trace: the field under it, the trace itself, and — for the
 /// pre-EQ layer — the peak-hold line above it.
-#[allow(clippy::too_many_arguments)]
 fn draw_spectrum(
     painter: &nih_plug_egui::egui::Painter,
     scratch: &mut spectrum::Scratch,
     points: &[f32],
     axes: &Axes,
     smoothing: f32,
-    fill: Color32,
-    stroke: Color32,
-    hold_peaks: bool,
+    layer: SpectrumLayer,
 ) {
+    let hold_peaks = layer == SpectrumLayer::Pre;
     let columns = axes.plot.width().round().max(2.0) as usize;
     let left = axes.plot.min.x;
     let width = axes.plot.width();
@@ -822,13 +887,48 @@ fn draw_spectrum(
         return;
     }
 
-    painter.add(area_mesh(&trace, axes.plot.max.y, fill));
-    painter.add(Shape::Path(PathShape {
-        points: trace,
-        closed: false,
-        fill: Color32::TRANSPARENT,
-        stroke: PathStroke::new(1.0, stroke),
-    }));
+    match layer {
+        SpectrumLayer::Pre => {
+            // The reference: a whisper of fill and a thin neutral line, held
+            // well under the processed signal.
+            painter.add(area_mesh(
+                &trace,
+                axes.plot.max.y,
+                Color32::from_rgba_unmultiplied(168, 165, 180, 12),
+            ));
+            painter.add(Shape::Path(PathShape {
+                points: trace,
+                closed: false,
+                fill: Color32::TRANSPARENT,
+                stroke: PathStroke::new(1.0, Color32::from_rgba_unmultiplied(186, 182, 198, 110)),
+            }));
+        }
+        SpectrumLayer::Post => {
+            let energy: Vec<f32> = curve
+                .iter()
+                .map(|db| ((db - FLOOR_DB) / span).clamp(0.0, 1.0))
+                .collect();
+            painter.add(spectrum_fill(&trace, &energy, axes.plot));
+
+            // The edge, three strokes deep: a wide whisper of glow, a soft
+            // pink line, and the crisp pale core that stays readable over
+            // the fill. No giant bloom.
+            let tune = crate::gui::tune::get();
+            let glow = tune.spectrum_glow;
+            for (width, color) in [
+                (6.0, fade(SPECTRUM_ROSE, 0.10 * glow)),
+                (2.6, fade(SPECTRUM_ROSE, 0.30 * glow)),
+                (1.1, fade(SPECTRUM_PEAK, 0.88)),
+            ] {
+                painter.add(Shape::Path(PathShape {
+                    points: trace.clone(),
+                    closed: false,
+                    fill: Color32::TRANSPARENT,
+                    stroke: PathStroke::new(width, color),
+                }));
+            }
+        }
+    }
 
     if hold_peaks {
         let peaks: Vec<Pos2> = scratch
@@ -843,10 +943,73 @@ fn draw_spectrum(
                 points: peaks,
                 closed: false,
                 fill: Color32::TRANSPARENT,
-                stroke: PathStroke::new(1.0, Color32::from_rgba_unmultiplied(214, 214, 220, 56)),
+                stroke: PathStroke::new(1.0, Color32::from_rgba_unmultiplied(214, 214, 220, 40)),
             }));
         }
     }
+}
+
+/// The processed spectrum's field: a gradient hung from the curve itself.
+///
+/// Two components combine per vertex. The curve-local one is the material —
+/// pale at the edge, saturated rose just under it, falling through magenta and
+/// plum to almost nothing — and rides the trace, so a peak carries its own
+/// light down with it. The global one leans the whole field slightly darker
+/// toward the graph floor. The grid stays visible through all of it.
+fn spectrum_fill(trace: &[Pos2], energy: &[f32], plot: Rect) -> Shape {
+    let tune = crate::gui::tune::get();
+    let fill = tune.spectrum_fill;
+    let depth = tune.spectrum_depth;
+
+    // Distance below the curve each row sits, and the alpha it carries.
+    let offsets = [0.0, 10.0 * depth, 26.0 * depth, 64.0 * depth];
+    let alphas = [0.72 * fill, 0.46 * fill, 0.24 * fill, 0.10 * fill, 0.035 * fill];
+
+    let mut mesh = Mesh::default();
+    if trace.len() < 2 || plot.height() <= 0.0 {
+        return Shape::Mesh(mesh.into());
+    }
+
+    let depth_dim = |y: f32| {
+        let t = ((y - plot.min.y) / plot.height()).clamp(0.0, 1.0);
+        1.0 - 0.18 * t
+    };
+
+    for (i, p) in trace.iter().enumerate() {
+        let e = energy.get(i).copied().unwrap_or(0.0);
+        let edge = energy_color(e);
+        // Row colours: the edge's own light first, blending down the ramp.
+        let colors = [
+            edge,
+            theme::mix(SPECTRUM_ROSE, edge, 0.35),
+            SPECTRUM_MID,
+            SPECTRUM_LOW,
+            SPECTRUM_FLOOR,
+        ];
+        for row in 0..5 {
+            let y = if row < 4 {
+                (p.y + offsets[row]).min(plot.max.y)
+            } else {
+                plot.max.y
+            };
+            mesh.colored_vertex(
+                pos2(p.x, y),
+                fade(colors[row], alphas[row] * depth_dim(y)),
+            );
+        }
+    }
+
+    // Two triangles per band per column pair, five rows to a column.
+    let cols = trace.len() as u32;
+    for i in 0..cols - 1 {
+        for row in 0..4u32 {
+            let a = i * 5 + row;
+            let b = (i + 1) * 5 + row;
+            mesh.add_triangle(a, a + 1, b);
+            mesh.add_triangle(a + 1, b, b + 1);
+        }
+    }
+    Shape::Mesh(mesh.into())
 }
 
 /// The resonance stage's live reduction, hanging off the zero line.
@@ -894,6 +1057,13 @@ fn stroke_band(
     }
     if focused {
         painter.add(area_mesh(&points, axes.y(0.0), fade(color, 0.12)));
+        // The chosen band carries a little more light than its neighbours.
+        painter.add(Shape::Path(PathShape {
+            points: points.clone(),
+            closed: false,
+            fill: Color32::TRANSPARENT,
+            stroke: PathStroke::new(4.2, fade(color, 0.14)),
+        }));
     }
     painter.add(Shape::Path(PathShape {
         points,

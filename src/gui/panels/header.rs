@@ -13,7 +13,7 @@ use nih_plug_egui::egui::{
 use crate::gui::edit::{self, Frame};
 use crate::gui::gpu::FxRenderer;
 use crate::gui::presets;
-use crate::gui::state::{AbSlot, Snapshot, UiState};
+use crate::gui::state::{AbSlot, ChannelView, Snapshot, UiState};
 use crate::gui::theme::{self, white};
 use crate::gui::widgets::chrome::{self, Fill, PILL_HEIGHT};
 use crate::gui::widgets::glyph;
@@ -61,22 +61,42 @@ pub fn show(
         state.status = None;
     }
 
-    ui.spacing_mut().item_spacing.x = 8.0;
+    ui.spacing_mut().item_spacing.x = 10.0;
 
     // --- identity -------------------------------------------------------
-    let (mark, _) = ui.allocate_exact_size(vec2(64.0, PILL_HEIGHT), Sense::hover());
-    ui.painter().text(
+    //
+    // The wordmark of `assets/logo.svg`, at the sixteen pixels of cap height
+    // the old bar gave the image: four letters set solid, and the thin-stroke
+    // X the logotype signs off with, drawn because no cut this UI ships is
+    // that light.
+    let (mark, _) = ui.allocate_exact_size(vec2(84.0, PILL_HEIGHT), Sense::hover());
+    let word = ui.painter().text(
         pos2(mark.min.x + 4.0, mark.center().y),
         Align2::LEFT_CENTER,
-        menu::spaced("EQUZX"),
-        FontId::proportional(theme::BODY),
-        white(225),
+        "EQUZ",
+        theme::semibold(22.0),
+        Color32::WHITE,
     );
-    chrome::divider(ui, 18.0);
+    let (x0, cy, xw, xh) = (word.max.x + 2.5, mark.center().y, 13.0, 15.6);
+    for (a, b) in [
+        (pos2(x0, cy - xh / 2.0), pos2(x0 + xw, cy + xh / 2.0)),
+        (pos2(x0 + xw, cy - xh / 2.0), pos2(x0, cy + xh / 2.0)),
+    ] {
+        ui.painter()
+            .line_segment([a, b], nih_plug_egui::egui::Stroke::new(1.1, Color32::WHITE));
+    }
+    chrome::divider(ui, 20.0);
 
     // --- A/B ------------------------------------------------------------
-    if let Some(picked) = chrome::segmented(ui, &["A", "B"], ui_state.slot as usize, theme::NEON, 24.0)
-    {
+    if let Some(picked) = chrome::segmented(
+        ui,
+        &["A", "B"],
+        ui_state.slot as usize,
+        theme::NEON,
+        28.0,
+        PILL_HEIGHT,
+        theme::semibold(theme::SMALL),
+    ) {
         let wanted = if picked == 0 { AbSlot::A } else { AbSlot::B };
         if wanted != ui_state.slot {
             swap_slots(frame, ui_state);
@@ -88,19 +108,19 @@ pub fn show(
 
     preset_menu(ui, frame, fx, state, ui_state);
 
-    // --- everything that acts on the output, pushed to the right --------
+    // --- everything that acts on the picture or the output, pushed right --
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
+        ui.spacing_mut().item_spacing.x = 10.0;
 
         // Laid out right to left, so this reads bottom-up against the original.
         let more = Id::new("more-menu");
-        let anchor = menu::trigger(ui, more, 28.0, |ui, rect, fg| {
+        let anchor = menu::trigger(ui, more, 32.0, |ui, rect, fg| {
             for dx in [-4.0f32, 0.0, 4.0] {
                 ui.painter()
                     .circle_filled(pos2(rect.center().x + dx, rect.center().y), 1.3, fg);
             }
         });
-        menu::popup(ui, more, anchor, MenuAlign::End, 200.0, fx, |ui, close| {
+        menu::popup(ui, more, anchor, MenuAlign::End, 196.0, fx, |ui, close| {
             if menu::item(ui, "Reset to flat", false, true).clicked() {
                 edit::reset_all(frame);
                 *close = true;
@@ -134,6 +154,49 @@ pub fn show(
         super::resonance::show(ui, frame, fx);
 
         output_gain(ui, frame);
+
+        chrome::divider(ui, 20.0);
+
+        // --- what the plot shows: the view and range pickers --------------
+        // These describe the picture rather than the sound, but the original
+        // kept them here at the bar's right end, ahead of the output group.
+        let ranges: Vec<String> = super::overlays::DB_RANGES
+            .iter()
+            .map(|r| format!("± {r:.0} dB"))
+            .collect();
+        let range_refs: Vec<&str> = ranges.iter().map(String::as_str).collect();
+        let range_current = super::overlays::DB_RANGES
+            .iter()
+            .position(|r| (*r - ui_state.db_range).abs() < 0.001)
+            .unwrap_or(2);
+        if let Some(i) = menu::dropdown(
+            ui,
+            Id::new("range-menu"),
+            "Range",
+            &range_refs,
+            range_current,
+            MenuAlign::End,
+            fx,
+        ) {
+            ui_state.db_range = super::overlays::DB_RANGES[i];
+        }
+
+        let views: Vec<&str> = ChannelView::ALL.iter().map(|v| v.label()).collect();
+        let view_current = ChannelView::ALL
+            .iter()
+            .position(|v| *v == ui_state.channel_view)
+            .unwrap_or(0);
+        if let Some(i) = menu::dropdown(
+            ui,
+            Id::new("view-menu"),
+            "View",
+            &views,
+            view_current,
+            MenuAlign::End,
+            fx,
+        ) {
+            ui_state.channel_view = ChannelView::ALL[i];
+        }
     });
 }
 
@@ -142,9 +205,10 @@ pub fn show(
 fn copy_button(ui: &mut Ui, slot: AbSlot) -> nih_plug_egui::egui::Response {
     let (rect, response) = ui.allocate_exact_size(vec2(52.0, PILL_HEIGHT), Sense::click());
     let fill = Fill::Quiet;
-    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, response.hovered());
+    let hover = crate::gui::anim::state(ui.ctx(), response.id, response.hovered(), 0.16);
+    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, hover);
 
-    let fg = fill.foreground(response.hovered());
+    let fg = fill.foreground(hover);
     let font = FontId::proportional(theme::SMALL);
     ui.painter().text(
         pos2(rect.min.x + 12.0, rect.center().y),
@@ -177,23 +241,38 @@ fn output_gain(ui: &mut Ui, frame: &Frame) {
     let value = frame.params.output_gain.value();
     let format = |v: f32| format!("{}{:.1} dB", if v > 0.0 { "+" } else { "" }, v);
 
+    // Sized to the widest value the knob can show, so the pill hugs its
+    // contents without breathing while the value is dragged.
+    let caption_w = menu::text_width(ui, &format(-24.0), &theme::medium(theme::SMALL))
+        .max(menu::text_width(ui, "OUT", &theme::caption()));
+    let width = 6.0 + 24.0 + 6.0 + caption_w + 12.0;
+
     // Allocated rather than read off the cursor: this sits inside the header's
     // right-to-left group, where the cursor's left edge is negative infinity
     // because the layout has not yet decided how far left the run reaches.
-    let (rect, response) = ui.allocate_exact_size(vec2(104.0, PILL_HEIGHT), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::hover());
 
     // A pill drawn round the dial, rather than the dial drawn inside a button:
     // the plate has to be down before the knob paints over it.
-    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, Fill::Quiet, false);
+    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, Fill::Quiet, 0.0);
 
+    // The knob hugs whatever the value currently measures; centring the block
+    // keeps the pill balanced while the reserved width holds still.
+    let shown = menu::text_width(ui, &format(value), &theme::medium(theme::SMALL))
+        .max(menu::text_width(ui, "OUT", &theme::caption()));
+    let content = 24.0 + 6.0 + shown;
+    let slack = ((rect.width() - content) / 2.0).max(2.0);
     let mut inner = ui.new_child(
         nih_plug_egui::egui::UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(7.0, 2.0)))
+            .max_rect(Rect::from_min_max(
+                pos2(rect.min.x + slack, rect.min.y + 2.0),
+                pos2(rect.max.x - 2.0, rect.max.y - 2.0),
+            ))
             .layout(Layout::left_to_right(Align::Center)),
     );
     if let Some(v) = Knob::new("Out", value, -24.0, 12.0, &format)
         .default_value(0.0)
-        .size(22.0)
+        .size(24.0)
         .inline(true)
         .show(&mut inner)
     {
@@ -206,8 +285,9 @@ fn bypass_button(ui: &mut Ui, bypassed: bool) -> nih_plug_egui::egui::Response {
     let width = 78.0;
     let (rect, response) = ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::click());
     let fill = if bypassed { Fill::Armed } else { Fill::Quiet };
-    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, response.hovered());
-    let fg = fill.foreground(response.hovered());
+    let hover = crate::gui::anim::state(ui.ctx(), response.id, response.hovered(), 0.16);
+    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, hover);
+    let fg = fill.foreground(hover);
     ui.painter().add(glyph::power(
         Rect::from_center_size(pos2(rect.min.x + 16.0, rect.center().y), vec2(12.0, 12.0)),
         fg,
@@ -254,28 +334,28 @@ fn preset_menu(
         });
 
     let caption = menu::spaced("Preset");
-    let caption_w = menu::text_width(ui, &caption, &FontId::proportional(theme::MICRO));
-    let value_w = menu::text_width(ui, &shown, &FontId::proportional(theme::SMALL)).min(120.0);
-    let anchor = menu::trigger(ui, id, caption_w + value_w + 36.0, |ui, rect, fg| {
+    let caption_w = menu::text_width(ui, &caption, &theme::caption());
+    let value_w = menu::text_width(ui, &shown, &theme::medium(theme::SMALL)).min(120.0);
+    let anchor = menu::trigger(ui, id, caption_w + value_w + 49.0, |ui, rect, _| {
         let painter = ui.painter();
         painter.text(
-            pos2(rect.min.x + 10.0, rect.center().y),
+            pos2(rect.min.x + 12.0, rect.center().y),
             Align2::LEFT_CENTER,
             &caption,
-            FontId::proportional(theme::MICRO),
-            white(95),
+            theme::caption(),
+            white(89),
         );
         painter.text(
-            pos2(rect.min.x + 10.0 + caption_w + 6.0, rect.center().y),
+            pos2(rect.min.x + 12.0 + caption_w + 8.0, rect.center().y),
             Align2::LEFT_CENTER,
             &shown,
-            FontId::proportional(theme::SMALL),
-            fg,
+            theme::medium(theme::SMALL),
+            white(230),
         );
         painter.add(glyph::chevron(
-            Rect::from_center_size(pos2(rect.max.x - 11.0, rect.center().y), vec2(10.0, 10.0)),
-            menu::is_open(ui, id),
-            white(110),
+            Rect::from_center_size(pos2(rect.max.x - 12.0, rect.center().y), vec2(9.0, 9.0)),
+            crate::gui::anim::state(ui.ctx(), id.with("chev"), menu::is_open(ui, id), 0.15),
+            white(89),
         ));
     });
 
@@ -296,7 +376,7 @@ fn preset_menu(
                 let row = menu::item(ui, &name, selected, false);
                 // The delete cross, over the right end of the row it belongs to.
                 let cross = Rect::from_center_size(
-                    pos2(row.rect.max.x - 12.0, row.rect.center().y),
+                    pos2(row.rect.max.x - 18.0, row.rect.center().y),
                     vec2(16.0, 16.0),
                 );
                 let hit = ui.interact(cross, ui.id().with(("del", &name)), Sense::click());
@@ -353,7 +433,13 @@ fn preset_menu(
             );
             let submitted =
                 field.lost_focus() && ui.input(|i| i.key_pressed(nih_plug_egui::egui::Key::Enter));
-            let save = chrome::pill(ui, "Save", Fill::Solid(theme::NEON));
+            let save = chrome::pill_compact(
+                ui,
+                menu::spaced("Save").trim_end(),
+                Fill::Solid(theme::NEON),
+                None,
+                28.0,
+            );
             if save.clicked() || submitted {
                 let name = if state.draft.trim().is_empty() {
                     state.current.clone()

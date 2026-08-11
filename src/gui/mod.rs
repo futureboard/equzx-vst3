@@ -12,6 +12,7 @@
 //! else floats over it, frosted, so the picture is never cut into by its own
 //! chrome.
 
+pub mod anim;
 pub mod curves;
 pub mod display;
 pub mod edit;
@@ -23,6 +24,7 @@ pub mod preview;
 pub mod spectrum;
 pub mod state;
 pub mod theme;
+pub mod tune;
 pub mod widgets;
 
 use std::sync::atomic::Ordering;
@@ -127,8 +129,8 @@ impl View {
             persisted: String::new(),
             restored: false,
             selected: None,
-            header_height: 42.0,
-            bottom_height: 260.0,
+            header_height: 54.0,
+            bottom_height: 244.0,
         }
     }
 }
@@ -191,6 +193,7 @@ pub fn create(ctx: EditorContext) -> Option<Box<dyn Editor>> {
                 .show(egui_ctx, &state, |ui| {
                     layout(ui, &frame, view, &bands);
                 });
+            tune::window(egui_ctx);
 
             // Push the view state back for the session to hold, but only when
             // it moved: this runs every frame, and the parameter is a lock.
@@ -223,31 +226,33 @@ fn layout(ui: &mut Ui, frame: &Frame, app: &mut View, bands: &[state::BandView])
         hint(ui, plot_rect, bands.is_empty());
     }
 
-    // --- the two overlays, over the plot's upper corners ------------------
+    // --- the analyser pickers, over the plot's top-right corner -----------
+    // Held at rest opacity until pointed at, so they don't compete with the
+    // spectrum they describe.
     let fx = frame.fx.clone();
-    Floating::new("view-overlay", plot_rect.min + vec2(display::PAD_LEFT, INSET))
-        .padding(vec2(5.0, 5.0))
-        .radius(18.0)
-        .show(ui.ctx(), &fx, |ui| {
-            panels::overlays::view(ui, &mut app.ui, &fx)
-        });
     Floating::new(
         "analyzer-overlay",
         pos2(plot_rect.max.x - INSET, plot_rect.min.y + INSET),
     )
     .pivot(Align2::RIGHT_TOP)
-    .padding(vec2(5.0, 5.0))
-    .radius(18.0)
+    .padding(vec2(4.0, 4.0))
+    .radius(20.0)
+    .dim(0.55)
+    .intro(0.07)
+    .glass(gpu::Glass::panel(0.7))
     .show(ui.ctx(), &fx, |ui| {
         panels::overlays::analyzer(ui, &mut app.ui, &fx)
     });
 
     // --- header -----------------------------------------------------------
+    // The most forward pane of glass in the stack, so the most reflective.
     let header = Floating::new("header", full.min + vec2(INSET, INSET))
         .width(full.width() - INSET * 2.0)
-        .padding(vec2(8.0, 7.0))
+        .padding(vec2(10.0, 11.0))
         .radius(theme::R_PANEL as f32)
         .sheen(true)
+        .intro(0.0)
+        .glass(gpu::Glass::panel(1.0))
         .show(ui.ctx(), &fx, |ui| {
             panels::header::show(ui, frame, &fx, &mut app.header, &mut app.ui)
         });
@@ -263,7 +268,11 @@ fn layout(ui: &mut Ui, frame: &Frame, app: &mut View, bands: &[state::BandView])
         .padding(vec2(0.0, 0.0))
         .radius(theme::R_PANEL as f32)
         .vertical()
+        .intro(0.14)
+        .glass(gpu::Glass::panel(0.8))
         .show(ui.ctx(), &fx, |ui| {
+            // The resizer sits flush on the strip, one slab — no gap.
+            ui.spacing_mut().item_spacing.y = 0.0;
             let mut height = panel_height;
             panels::band_strip::resizer(ui, width, &mut height, panel_max);
             app.ui.panel_height = height;
@@ -586,7 +595,7 @@ mod tests {
     }
 
     /// The panels every frame is expected to put on screen.
-    const PANELS: [&str; 4] = ["header", "bottom", "view-overlay", "analyzer-overlay"];
+    const PANELS: [&str; 3] = ["header", "bottom", "analyzer-overlay"];
 
     #[test]
     fn the_whole_editor_lays_out_and_tessellates() {

@@ -25,7 +25,13 @@ use crate::gui::widgets::Knob;
 /// the order they were written — chevron first, then the switch it belongs to.
 pub fn show(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
     let enabled = frame.params.resonance.enabled.value();
-    let width = SWITCH_WIDTH + if enabled { READOUT_WIDTH } else { 0.0 } + CHEVRON_WIDTH;
+    let grow = crate::gui::anim::state(
+        ui.ctx(),
+        nih_plug_egui::egui::Id::new("res-grow"),
+        enabled,
+        0.18,
+    );
+    let width = SWITCH_WIDTH + READOUT_WIDTH * grow + CHEVRON_WIDTH;
     ui.allocate_ui_with_layout(
         vec2(width, PILL_HEIGHT),
         nih_plug_egui::egui::Layout::left_to_right(nih_plug_egui::egui::Align::Center),
@@ -56,41 +62,53 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
     } else {
         String::new()
     };
-    let width = SWITCH_WIDTH + if enabled { READOUT_WIDTH } else { 0.0 };
+    let grow = crate::gui::anim::state(
+        ui.ctx(),
+        nih_plug_egui::egui::Id::new("res-grow"),
+        enabled,
+        0.18,
+    );
+    let width = SWITCH_WIDTH + READOUT_WIDTH * grow;
     let (switch_rect, switch) = ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::click());
 
     let fill = if enabled { Fill::Armed } else { Fill::Quiet };
-    // Only the left half is rounded: the chevron beside it completes the pill.
+    // One plate under the whole control — the chevron draws no fill of its
+    // own, so there is no seam where the two halves meet.
+    let hover = crate::gui::anim::state(ui.ctx(), switch.id, switch.hovered(), 0.16);
     chrome::pill_bg(
         ui,
-        switch_rect.with_max_x(switch_rect.max.x + 8.0),
+        switch_rect.with_max_x(switch_rect.max.x + CHEVRON_WIDTH),
         PILL_HEIGHT / 2.0,
         fill,
-        switch.hovered(),
+        hover,
     );
-    let fg = fill.foreground(switch.hovered());
+    let fg = fill.foreground(hover);
+    // Icon and label as one block, centred in the switch's own width — the
+    // readout and chevron grow to the right of it.
+    let label_w = menu::text_width(ui, "Res", &FontId::proportional(theme::SMALL));
+    let start = switch_rect.min.x + (SWITCH_WIDTH - (13.0 + 4.0 + label_w)) / 2.0;
     ui.painter().add(glyph::resonance(
         Rect::from_center_size(
-            nih_plug_egui::egui::pos2(switch_rect.min.x + 15.0, switch_rect.center().y),
+            nih_plug_egui::egui::pos2(start + 6.5, switch_rect.center().y),
             vec2(13.0, 13.0),
         ),
         fg,
         1.5,
     ));
     ui.painter().text(
-        nih_plug_egui::egui::pos2(switch_rect.min.x + 25.0, switch_rect.center().y),
+        nih_plug_egui::egui::pos2(start + 17.0, switch_rect.center().y),
         Align2::LEFT_CENTER,
         "Res",
         FontId::proportional(theme::SMALL),
         fg,
     );
-    if enabled {
+    if grow > 0.2 {
         ui.painter().text(
             nih_plug_egui::egui::pos2(switch_rect.max.x - 6.0, switch_rect.center().y),
             Align2::RIGHT_CENTER,
             &readout,
             FontId::proportional(theme::SMALL),
-            theme::fade(fg, 0.8),
+            theme::fade(fg, 0.8 * grow),
         );
     }
     if switch.clicked() {
@@ -102,10 +120,10 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
 
     // --- the chevron that opens the rest --------------------------------
     let id = Id::new("resonance-menu");
-    let anchor = menu::trigger(ui, id, CHEVRON_WIDTH, |ui, rect, _| {
+    let anchor = menu::trigger_with(ui, id, CHEVRON_WIDTH, Fill::None, |ui, rect, _| {
         ui.painter().add(glyph::chevron(
             rect,
-            menu::is_open(ui, id),
+            crate::gui::anim::state(ui.ctx(), id.with("chev"), menu::is_open(ui, id), 0.15),
             white(110),
         ));
     });
@@ -137,6 +155,7 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
         let plain = |v: f32| format!("{v:.1}");
 
         ui.horizontal(|ui| {
+            ui.add_space(14.0);
             ui.spacing_mut().item_spacing.x = 4.0;
             if let Some(v) = knob(ui, "Depth", res.depth.value() * 100.0, 0.0, 100.0, 50.0, false, &percent) {
                 edit::set_float(frame.setter, &res.depth, v / 100.0);
@@ -152,6 +171,7 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
             }
         });
         ui.horizontal(|ui| {
+            ui.add_space(14.0);
             ui.spacing_mut().item_spacing.x = 4.0;
             if let Some(v) = knob(ui, "Attack", res.attack.value(), 0.5, 100.0, 5.0, true, &millis_fine) {
                 edit::set_float(frame.setter, &res.attack, v);

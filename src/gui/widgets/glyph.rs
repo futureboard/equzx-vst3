@@ -105,6 +105,50 @@ pub fn shape(kind: BandKind, rect: Rect, color: Color32, width: f32) -> Shape {
     })
 }
 
+/// The EQUZX mark: one bell band standing off its baseline, the peak lit.
+///
+/// The same drawing as `assets/logo-lockup.svg`, in the same 24×16 box — kept
+/// in step by hand the way the band glyphs above track the old stylesheet. The
+/// header wears the wordmark of `assets/logo.svg` instead; this mark is for
+/// anywhere a square emblem fits better than five letters.
+pub fn logo(rect: Rect, curve: Color32, peak: Color32, width: f32) -> Shape {
+    let scale = (rect.width() / 24.0).min(rect.height() / 16.0);
+    let o = Pos2::new(
+        rect.center().x - 12.0 * scale,
+        rect.center().y - 8.0 * scale,
+    );
+    let map = |x: f32, y: f32| Pos2::new(o.x + x * scale, o.y + y * scale);
+
+    // The bell, flattened from two quadratics: up through (9, 13.5)→(12, 3.5),
+    // down through (15, 13.5)→(23, 13.5).
+    let mut points = vec![map(1.0, 13.5)];
+    let mut cursor = (1.0f32, 13.5f32);
+    for (cx, cy, x, y) in [(9.0, 13.5, 12.0, 3.5), (15.0, 13.5, 23.0, 13.5)] {
+        for i in 1..=12 {
+            let t = i as f32 / 12.0;
+            let u = 1.0 - t;
+            points.push(map(
+                u * u * cursor.0 + 2.0 * u * t * cx + t * t * x,
+                u * u * cursor.1 + 2.0 * u * t * cy + t * t * y,
+            ));
+        }
+        cursor = (x, y);
+    }
+
+    let faint = crate::gui::theme::fade(curve, 0.28);
+    Shape::Vec(vec![
+        Shape::line_segment([map(1.0, 13.5), map(23.0, 13.5)], Stroke::new(1.0, faint)),
+        Shape::Path(nih_plug_egui::egui::epaint::PathShape {
+            points,
+            closed: false,
+            fill: Color32::TRANSPARENT,
+            stroke: PathStroke::new(width, curve),
+        }),
+        Shape::circle_filled(map(12.0, 3.5), 2.6 * scale, crate::gui::theme::fade(peak, 0.30)),
+        Shape::circle_filled(map(12.0, 3.5), 1.4 * scale, peak),
+    ])
+}
+
 /// The power symbol on the bypass button.
 pub fn power(rect: Rect, color: Color32, width: f32) -> Shape {
     let c = rect.center();
@@ -181,11 +225,12 @@ pub fn arrow_right(rect: Rect, color: Color32, width: f32) -> Shape {
     ])
 }
 
-/// A chevron, pointing down when closed and up when open.
-pub fn chevron(rect: Rect, open: bool, color: Color32) -> Shape {
+/// A chevron, pointing down when closed and up when open. `openness` is the
+/// eased 0..1 of the flip, so it turns over rather than snapping.
+pub fn chevron(rect: Rect, openness: f32, color: Color32) -> Shape {
     let c = rect.center();
     let (w, h) = (3.4, 2.0);
-    let dir = if open { -1.0 } else { 1.0 };
+    let dir = 1.0 - 2.0 * openness.clamp(0.0, 1.0);
     Shape::Path(nih_plug_egui::egui::epaint::PathShape {
         points: vec![
             Pos2::new(c.x - w, c.y - h * dir),

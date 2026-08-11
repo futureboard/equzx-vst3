@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use nih_plug_egui::egui::{self, vec2, Align2, Area, Context, Id, Margin, Order, Pos2, Rect, Ui, Vec2};
 
-use crate::gui::gpu::FxRenderer;
+use crate::gui::gpu::{FxRenderer, Glass};
 use crate::gui::widgets::chrome;
 
 /// How a floating panel is laid out.
@@ -31,6 +31,13 @@ pub struct Floating {
     pub horizontal: bool,
     /// Follow the pointer with a specular highlight while it is over the plate.
     pub sheen: bool,
+    /// Rest at this opacity until pointed at — the analyser overlay's way of
+    /// not competing with the curve it sits over.
+    pub dim: Option<f32>,
+    /// Seconds after the editor opens before this panel fades and settles in.
+    pub intro: Option<f32>,
+    /// The material the plate is cut from.
+    pub glass: Glass,
 }
 
 impl Floating {
@@ -44,6 +51,9 @@ impl Floating {
             radius: 22.0,
             horizontal: true,
             sheen: false,
+            dim: None,
+            intro: None,
+            glass: Glass::panel(0.8),
         }
     }
 
@@ -77,6 +87,21 @@ impl Floating {
         self
     }
 
+    pub fn dim(mut self, resting: f32) -> Self {
+        self.dim = Some(resting);
+        self
+    }
+
+    pub fn glass(mut self, glass: Glass) -> Self {
+        self.glass = glass;
+        self
+    }
+
+    pub fn intro(mut self, delay: f32) -> Self {
+        self.intro = Some(delay);
+        self
+    }
+
     /// Show the plate. Returns the rectangle it ended up occupying, which is
     /// what the layout above uses to keep the plot clear of it.
     pub fn show(
@@ -85,12 +110,42 @@ impl Floating {
         fx: &Arc<FxRenderer>,
         contents: impl FnOnce(&mut Ui),
     ) -> Rect {
+        // Eased fades, multiplied together: the resting dim until pointed at,
+        // and the once-per-open intro that settles the panel up into place.
+        let mut opacity = 1.0f32;
+        let mut settle = 0.0f32;
+        if let Some(resting) = self.dim {
+            // Judged against last frame's rectangle — this frame's is not
+            // known yet, and one frame of lag on a hover fade is invisible.
+            let hovered = ctx
+                .memory(|m| m.area_rect(self.id))
+                .zip(ctx.pointer_hover_pos())
+                .is_some_and(|(rect, pointer)| rect.contains(pointer));
+            let t = crate::gui::anim::state(ctx, self.id.with("dim"), hovered, 0.2);
+            opacity *= resting + (1.0 - resting) * t;
+        }
+        // Skipped headless: the harness renders a handful of passes from t=0,
+        // and a preview of a UI mid-fade answers nothing.
+        if let (Some(delay), false) = (self.intro, cfg!(test)) {
+            let now = ctx.input(|i| i.time);
+            let t0 = ctx.data_mut(|d| {
+                *d.get_temp_mut_or_insert_with(Id::new("equzx-intro-t0"), || now)
+            });
+            let e = crate::gui::anim::ease(((now - t0) as f32 - delay) / 0.62);
+            opacity *= e;
+            settle = 12.0 * (1.0 - e);
+        }
+
         Area::new(self.id)
             .order(Order::Foreground)
-            .fixed_pos(self.pos)
+            .fixed_pos(self.pos + egui::vec2(0.0, settle))
             .pivot(self.pivot)
             .constrain(false)
             .show(ctx, |ui| {
+                if opacity < 1.0 {
+                    ui.set_opacity(opacity);
+                }
+
                 // The plate is reserved before the contents so the blur callback
                 // is earlier in the draw list than everything it sits under.
                 let slot = chrome::reserve_glass(ui);
@@ -140,7 +195,10 @@ impl Floating {
                 } else {
                     None
                 };
-                chrome::fill_glass(ui, slot, fx, rect, self.radius, sheen);
+                let mut style = self.glass;
+                style.corner_radius = self.radius;
+                style.opacity = opacity;
+                chrome::fill_glass(ui, slot, fx, rect, style, sheen);
                 rect
             })
             .inner

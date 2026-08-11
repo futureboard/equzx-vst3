@@ -40,20 +40,41 @@ const UP: &str = include_str!("shaders/up.frag");
 const GLASS: &str = include_str!("shaders/glass.frag");
 const BLOOM: &str = include_str!("shaders/bloom.frag");
 
-/// A frosted plate. Sizes are in egui points; the renderer converts.
+/// The material one smoked-glass surface is made of. Sizes are in egui
+/// points; the renderer converts.
+///
+/// One struct serves every large surface — header, inspector, the recessed
+/// dynamics card, popovers, the band readout — with the presets below setting
+/// how forward each one sits. Small controls do not run this shader; they
+/// approximate the material with plain paint in `chrome`.
 #[derive(Clone, Copy, Debug)]
 pub struct Glass {
     /// Tint laid over the blurred backdrop. Alpha is how much of the plate is
     /// tint rather than backdrop.
     pub tint: Color32,
     pub corner_radius: f32,
-    /// Strength of the inner bevel highlight.
-    pub rim: f32,
+    /// The reflection hanging just inside the top edge.
+    pub top_reflection: f32,
+    /// The directional rim where the border faces the light, up and to the
+    /// left of the surface.
+    pub edge_reflection: f32,
+    /// The thin bevel highlight tracing the whole border.
+    pub inner_highlight: f32,
+    /// How much darker the plate sits into its bottom seat.
+    pub bottom_shadow: f32,
+    /// Width of the crisp rim reflection, in points.
+    pub specular_width: f32,
+    /// The one broad, static reflection band crossing the surface.
+    pub band: f32,
+    /// Ambient accent bled into the body, as if the UI's pink reflected in.
+    pub rose: f32,
     /// Film grain, which keeps a large plate from banding.
     pub noise: f32,
     /// Where the specular highlight sits, relative to the plate's top-left.
     pub sheen: Option<Pos2>,
     pub sheen_amount: f32,
+    /// Whole-plate opacity, for eased fades. 1.0 is the resting state.
+    pub opacity: f32,
     /// Halvings before the blur turns around. More is softer and cheaper per
     /// pixel, but starts to lose the shape of what is behind it.
     pub levels: u32,
@@ -61,14 +82,87 @@ pub struct Glass {
 
 impl Default for Glass {
     fn default() -> Self {
+        Self::panel(0.8)
+    }
+}
+
+impl Glass {
+    /// A floating plate, by how forward it sits: the header at 1.0, the
+    /// inspector around 0.8, popovers around 0.7. One knob keeps the family
+    /// related without making every surface equally glossy.
+    pub fn panel(strength: f32) -> Self {
+        let tune = crate::gui::tune::get();
+        let reflect = strength * tune.glass_reflection;
         Self {
-            tint: Color32::from_rgba_unmultiplied(0x16, 0x16, 0x1a, 130),
+            tint: Color32::from_rgba_unmultiplied(
+                0x16,
+                0x16,
+                0x1a,
+                (140.0 * tune.glass_tint) as u8,
+            ),
             corner_radius: 22.0,
-            rim: 0.055,
+            top_reflection: 0.050 * reflect,
+            edge_reflection: 0.34 * reflect * tune.glass_edge,
+            inner_highlight: 0.040 * reflect,
+            bottom_shadow: 0.20 * strength.min(1.0),
+            specular_width: 1.6,
+            band: 0.022 * reflect,
+            rose: 0.010 * strength,
             noise: 0.012,
             sheen: None,
             sheen_amount: 0.0,
+            opacity: 1.0,
             levels: 3,
+        }
+    }
+
+    /// The recessed card inside the inspector: more smoked, barely lit, no
+    /// broad reflection — glass set into the surface rather than floating
+    /// over it.
+    pub fn recessed() -> Self {
+        let tune = crate::gui::tune::get();
+        Self {
+            tint: Color32::from_rgba_unmultiplied(
+                0x0e,
+                0x0e,
+                0x12,
+                (170.0 * tune.glass_tint) as u8,
+            ),
+            corner_radius: 16.0,
+            top_reflection: 0.028 * tune.glass_reflection,
+            edge_reflection: 0.13 * tune.glass_reflection * tune.glass_edge,
+            inner_highlight: 0.022 * tune.glass_reflection,
+            bottom_shadow: 0.26,
+            specular_width: 1.2,
+            band: 0.0,
+            rose: 0.007,
+            noise: 0.010,
+            sheen: None,
+            sheen_amount: 0.0,
+            opacity: 1.0,
+            levels: 2,
+        }
+    }
+
+    /// The small readout beside a band handle: nearly opaque smoked black
+    /// with one caught edge, so the text stays sharp over a live spectrum.
+    pub fn tooltip() -> Self {
+        let tune = crate::gui::tune::get();
+        Self {
+            tint: Color32::from_rgba_unmultiplied(0x0a, 0x0a, 0x0d, 205),
+            corner_radius: 8.0,
+            top_reflection: 0.035 * tune.glass_reflection,
+            edge_reflection: 0.20 * tune.glass_reflection * tune.glass_edge,
+            inner_highlight: 0.030 * tune.glass_reflection,
+            bottom_shadow: 0.16,
+            specular_width: 1.2,
+            band: 0.0,
+            rose: 0.006,
+            noise: 0.008,
+            sheen: None,
+            sheen_amount: 0.0,
+            opacity: 1.0,
+            levels: 2,
         }
     }
 }
@@ -168,6 +262,13 @@ impl FxRenderer {
     }
 
     fn render(&self, info: &PaintCallbackInfo, painter: &Painter, job: Job) {
+        // The A/B switch: with EQUZX_DISABLE_FX set, no custom GL runs at all
+        // and every surface stays on its flat painted fallback.
+        static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *DISABLED.get_or_init(|| std::env::var_os("EQUZX_DISABLE_FX").is_some()) {
+            return;
+        }
+
         let gl = painter.gl();
 
         let Ok(mut state) = self.state.lock() else {
@@ -261,7 +362,8 @@ impl Resources {
                         "u_size",
                         "u_radius",
                         "u_tint",
-                        "u_rim",
+                        "u_mat_a",
+                        "u_mat_b",
                         "u_noise",
                         "u_sheen",
                         "u_sheen_amount",
@@ -383,19 +485,26 @@ impl Resources {
             return;
         }
 
+        // Whatever egui is drawing into. Always the default framebuffer today,
+        // but read back rather than assumed so an intermediate target upstream
+        // would not silently blur the wrong thing. Read before `ensure`, which
+        // binds its own framebuffers while it builds the chain — read after it,
+        // this captured one of the scratch targets, the composite went into a
+        // texture nobody presents, and the binding leaked into the rest of the
+        // frame: egui painted everything after this callback into it too.
+        let previous = unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
+        let previous = NonZeroU32::new(previous as u32).map(glow::NativeFramebuffer);
+
         let count = job.levels() as usize + 1;
         unsafe {
             self.ensure(gl, src_w, src_h, count);
+            // `ensure` leaves the last framebuffer it built bound; the window's
+            // must be back before anything is captured from or drawn to it.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, previous);
         }
         if self.levels.len() < 2 {
             return;
         }
-
-        // Whatever egui is drawing into. Always the default framebuffer today,
-        // but read back rather than assumed so an intermediate target upstream
-        // would not silently blur the wrong thing.
-        let previous = unsafe { gl.get_parameter_i32(glow::DRAW_FRAMEBUFFER_BINDING) };
-        let previous = NonZeroU32::new(previous as u32).map(glow::NativeFramebuffer);
 
         unsafe {
             // --- capture ---------------------------------------------------
@@ -488,7 +597,20 @@ impl Resources {
                         b as f32 / 255.0,
                         a as f32 / 255.0,
                     );
-                    gl.uniform_1_f32(s.at("u_rim"), g.rim);
+                    gl.uniform_4_f32(
+                        s.at("u_mat_a"),
+                        g.top_reflection,
+                        g.edge_reflection,
+                        g.inner_highlight,
+                        g.bottom_shadow,
+                    );
+                    gl.uniform_4_f32(
+                        s.at("u_mat_b"),
+                        g.specular_width * info.pixels_per_point,
+                        g.band,
+                        g.rose,
+                        g.opacity.clamp(0.0, 1.0),
+                    );
                     gl.uniform_1_f32(s.at("u_noise"), g.noise);
                     match g.sheen {
                         // The shader works bottom-up; egui hands us top-down.

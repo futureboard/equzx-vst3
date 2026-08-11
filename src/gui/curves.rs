@@ -24,7 +24,11 @@ pub const F_MIN: f32 = 20.0;
 pub const F_MAX: f32 = 22_000.0;
 
 /// Segments across the axis. One more point than this is evaluated.
-pub const CURVE_POINTS: usize = 480;
+///
+/// Fine enough that a segment is shorter than a pixel and a half at the
+/// default window: a steep bell drawn with the wide translucent glow strokes
+/// shows every kink, and 480 was visibly polygonal at the apex.
+pub const CURVE_POINTS: usize = 960;
 
 /// The frequencies a curve is evaluated at, with the per-frequency terms of
 /// `|H(e^jw)|` already worked out.

@@ -40,9 +40,11 @@ pub enum Align {
 
 /// Show a popover under `anchor`, if `id` is open.
 ///
-/// Closes on Escape, on a click anywhere outside it, or when the contents set
-/// the flag they are handed — which is how a menu row that did something gets
-/// the panel out of the way afterwards.
+/// Opens and closes with an eased fade and a short slide; while it is on its
+/// way out the rows still draw but no longer take input. Closes on Escape, on
+/// a click anywhere outside it, or when the contents set the flag they are
+/// handed — which is how a menu row that did something gets the panel out of
+/// the way afterwards.
 pub fn popup(
     ui: &Ui,
     id: Id,
@@ -52,7 +54,9 @@ pub fn popup(
     fx: &Arc<FxRenderer>,
     contents: impl FnOnce(&mut Ui, &mut bool),
 ) {
-    if !is_open(ui, id) {
+    let open = is_open(ui, id);
+    let reveal = crate::gui::anim::state(ui.ctx(), id.with("reveal"), open, 0.16);
+    if !open && reveal <= 0.01 {
         return;
     }
 
@@ -64,9 +68,13 @@ pub fn popup(
 
     let area = Area::new(id.with("panel"))
         .order(Order::Foreground)
-        .fixed_pos(Pos2::new(x, anchor.max.y + 6.0))
+        .fixed_pos(Pos2::new(x, anchor.max.y + 8.0 - 6.0 * (1.0 - reveal)))
         .constrain(true)
         .show(ui.ctx(), |ui| {
+            ui.set_opacity(reveal);
+            if !open {
+                ui.disable();
+            }
             ui.set_max_width(width);
             let slot = chrome::reserve_glass(ui);
             let inner = ui
@@ -80,7 +88,10 @@ pub fn popup(
                 .rect;
             let rect = Rect::from_min_size(inner.min, vec2(width, inner.height()))
                 .expand2(vec2(0.0, 0.0));
-            chrome::fill_glass(ui, slot, fx, rect, theme::R_MENU as f32, None);
+            let mut style = crate::gui::gpu::Glass::panel(0.7);
+            style.corner_radius = theme::R_MENU as f32;
+            style.opacity = reveal;
+            chrome::fill_glass(ui, slot, fx, rect, style, None);
             rect
         });
 
@@ -96,12 +107,13 @@ pub fn popup(
     }
 }
 
-/// One selectable row.
+/// One selectable row — `px-2.5 py-1.5 text-[11px]` in the old sheet. The
+/// highlight sits six points in from both panel edges; asymmetric slack here
+/// is immediately visible on the selected row's pill.
 pub fn item(ui: &mut Ui, text: &str, selected: bool, danger: bool) -> Response {
-    let width = ui.available_width() - 8.0;
+    let width = ui.available_width();
     let (rect, response) =
-        ui.allocate_exact_size(vec2(width, 22.0), Sense::click());
-    let rect = rect.translate(vec2(0.0, 0.0));
+        ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
 
     let fg = if danger {
         if response.hovered() {
@@ -126,11 +138,11 @@ pub fn item(ui: &mut Ui, text: &str, selected: bool, danger: bool) -> Response {
             white(24)
         };
         ui.painter()
-            .rect_filled(rect.shrink2(vec2(2.0, 0.0)), theme::corner(9), bg);
+            .rect_filled(rect.shrink2(vec2(6.0, 0.0)), theme::corner(12), bg);
     }
 
     ui.painter().text(
-        Pos2::new(rect.min.x + 10.0, rect.center().y),
+        Pos2::new(rect.min.x + 16.0, rect.center().y),
         Align2::LEFT_CENTER,
         text,
         FontId::proportional(theme::SMALL),
@@ -138,7 +150,7 @@ pub fn item(ui: &mut Ui, text: &str, selected: bool, danger: bool) -> Response {
     );
     if selected {
         // The tick the old menu drew on the selected row.
-        let c = Pos2::new(rect.max.x - 14.0, rect.center().y);
+        let c = Pos2::new(rect.max.x - 18.0, rect.center().y);
         ui.painter().add(Shape::Path(
             nih_plug_egui::egui::epaint::PathShape {
                 points: vec![
@@ -159,7 +171,7 @@ pub fn item(ui: &mut Ui, text: &str, selected: bool, danger: bool) -> Response {
 pub fn label(ui: &mut Ui, text: &str) {
     ui.add_space(3.0);
     ui.horizontal(|ui| {
-        ui.add_space(10.0);
+        ui.add_space(16.0);
         chrome::caption(ui, text);
     });
     ui.add_space(1.0);
@@ -167,9 +179,16 @@ pub fn label(ui: &mut Ui, text: &str) {
 
 pub fn divider(ui: &mut Ui) {
     ui.add_space(3.0);
-    let width = ui.available_width() - 8.0;
+    let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(vec2(width, 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0, white(18));
+    ui.painter().rect_filled(
+        Rect::from_min_max(
+            Pos2::new(rect.min.x + 6.0, rect.min.y),
+            Pos2::new(rect.max.x - 6.0, rect.max.y),
+        ),
+        0,
+        white(18),
+    );
     ui.add_space(3.0);
 }
 
@@ -177,11 +196,25 @@ pub fn divider(ui: &mut Ui) {
 ///
 /// Returns the trigger's rectangle so the caller can anchor the panel to it.
 pub fn trigger(ui: &mut Ui, id: Id, width: f32, draw: impl FnOnce(&Ui, Rect, Color32)) -> Rect {
+    trigger_with(ui, id, width, Fill::Quiet, draw)
+}
+
+/// The same, with the resting fill chosen by the caller — `Fill::None` lets a
+/// trigger sit flush on a plate another control already painted, instead of
+/// stamping its own rounded pill over it.
+pub fn trigger_with(
+    ui: &mut Ui,
+    id: Id,
+    width: f32,
+    resting: Fill,
+    draw: impl FnOnce(&Ui, Rect, Color32),
+) -> Rect {
     let open = is_open(ui, id);
     let (rect, response) = ui.allocate_exact_size(vec2(width, PILL_HEIGHT), Sense::click());
-    let fill = if open { Fill::Lit } else { Fill::Quiet };
-    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, response.hovered());
-    draw(ui, rect, fill.foreground(response.hovered()));
+    let fill = if open { Fill::Lit } else { resting };
+    let hover = crate::gui::anim::state(ui.ctx(), response.id, response.hovered(), 0.16);
+    chrome::pill_bg(ui, rect, PILL_HEIGHT / 2.0, fill, hover);
+    draw(ui, rect, fill.foreground(hover));
     if response.clicked() {
         set_open(ui, id, !open);
     }
@@ -201,41 +234,43 @@ pub fn dropdown(
     fx: &Arc<FxRenderer>,
 ) -> Option<usize> {
     let current = options.get(selected).copied().unwrap_or("—");
-    let font_caption = FontId::proportional(theme::MICRO);
-    let font_value = FontId::proportional(theme::SMALL);
+    let font_caption = theme::caption();
+    // `font-medium text-white/90` on the value in the original.
+    let font_value = theme::medium(theme::SMALL);
 
     let caption_w = text_width(ui, &spaced(caption_text), &font_caption);
     let value_w = options
         .iter()
         .map(|o| text_width(ui, o, &font_value))
         .fold(0.0f32, f32::max);
-    let width = caption_w + value_w + 34.0;
+    // px-3 either side, gap-2 between label, value and chevron.
+    let width = caption_w + value_w + 12.0 + 8.0 + 8.0 + 9.0 + 12.0;
 
-    let anchor = trigger(ui, id, width, |ui, rect, fg| {
+    let anchor = trigger(ui, id, width, |ui, rect, _| {
         let painter = ui.painter();
-        let mut x = rect.min.x + 10.0;
+        let mut x = rect.min.x + 12.0;
         painter.text(
             Pos2::new(x, rect.center().y),
             Align2::LEFT_CENTER,
             spaced(caption_text),
             font_caption.clone(),
-            white(95),
+            white(89),
         );
-        x += caption_w + 6.0;
+        x += caption_w + 8.0;
         painter.text(
             Pos2::new(x, rect.center().y),
             Align2::LEFT_CENTER,
             current,
             font_value.clone(),
-            fg,
+            white(230),
         );
         painter.add(glyph::chevron(
             Rect::from_center_size(
-                Pos2::new(rect.max.x - 10.0, rect.center().y),
-                vec2(10.0, 10.0),
+                Pos2::new(rect.max.x - 12.0, rect.center().y),
+                vec2(9.0, 9.0),
             ),
-            is_open(ui, id),
-            white(110),
+            crate::gui::anim::state(ui.ctx(), id.with("chev"), is_open(ui, id), 0.15),
+            white(89),
         ));
     });
 
@@ -245,7 +280,7 @@ pub fn dropdown(
         id,
         anchor,
         align,
-        (value_w + 44.0).max(132.0),
+        (value_w + 60.0).max(132.0),
         fx,
         |ui, close| {
             for (i, option) in options.iter().enumerate() {
@@ -281,8 +316,8 @@ pub fn text_width(ui: &Ui, text: &str, font: &FontId) -> f32 {
 
 /// A single-line text field, styled to match the pills around it.
 pub fn text_field(ui: &mut Ui, text: &mut String, hint: &str, width: f32) -> Response {
-    let (rect, _) = ui.allocate_exact_size(vec2(width, 24.0), Sense::hover());
-    let corner = theme::corner(12);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 28.0), Sense::hover());
+    let corner = theme::corner(14);
     ui.painter()
         .rect_filled(rect, corner, Color32::from_black_alpha(160));
 

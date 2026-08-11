@@ -7,7 +7,7 @@
 //! else.
 
 use nih_plug_egui::egui::{
-    epaint::PathStroke, vec2, Align2, Color32, FontId, Pos2, Response, Sense, Shape, Stroke, Ui,
+    epaint::PathStroke, vec2, Align2, Color32, Pos2, Response, Sense, Shape, Stroke, Ui,
     Vec2,
 };
 
@@ -51,7 +51,7 @@ impl<'a> Knob<'a> {
             default: None,
             color: NEON,
             disabled: false,
-            size: 40.0,
+            size: 48.0,
             inline: false,
             format,
         }
@@ -115,7 +115,7 @@ impl<'a> Knob<'a> {
                 .painter()
                 .layout_no_wrap(
                     text.clone(),
-                    FontId::proportional(theme::SMALL),
+                    theme::medium(theme::SMALL),
                     Color32::PLACEHOLDER,
                 )
                 .size()
@@ -124,7 +124,7 @@ impl<'a> Knob<'a> {
                     ui.painter()
                         .layout_no_wrap(
                             self.label.to_uppercase(),
-                            FontId::proportional(theme::MICRO),
+                            theme::caption(),
                             Color32::PLACEHOLDER,
                         )
                         .size()
@@ -132,7 +132,9 @@ impl<'a> Knob<'a> {
                 );
             vec2(self.size + 6.0 + caption_width, self.size)
         } else {
-            vec2(self.size.max(58.0), self.size + 24.0)
+            // The old panel gave every dial a 64-point column: dial, value,
+            // label, on a 4-point rhythm.
+            vec2(self.size.max(64.0), self.size + 33.0)
         };
 
         let sense = if self.disabled {
@@ -249,35 +251,38 @@ fn paint_caption(
     let painter = ui.painter();
     let label = knob.label.to_uppercase();
     if knob.inline {
+        // The two lines pull into each other — the `leading-tight` +
+        // `-space-y-1` stack of the original — so the pair reads as one
+        // block centred on the dial.
         let x = dial.max.x + 6.0;
         painter.text(
-            Pos2::new(x, rect.center().y - 1.0),
+            Pos2::new(x, rect.center().y + 1.5),
             Align2::LEFT_BOTTOM,
             label,
-            FontId::proportional(theme::MICRO),
-            dim(white(95), alpha),
+            theme::caption(),
+            dim(white(89), alpha),
         );
         painter.text(
-            Pos2::new(x, rect.center().y + 1.0),
+            Pos2::new(x, rect.center().y - 1.5),
             Align2::LEFT_TOP,
             text,
-            FontId::proportional(theme::SMALL),
+            theme::medium(theme::SMALL),
             dim(white(230), alpha),
         );
     } else {
         painter.text(
-            Pos2::new(rect.center().x, dial.max.y + 2.0),
+            Pos2::new(rect.center().x, dial.max.y + 3.0),
             Align2::CENTER_TOP,
             text,
-            FontId::proportional(theme::TINY),
-            dim(white(215), alpha),
+            theme::medium(theme::TINY),
+            dim(white(217), alpha),
         );
         painter.text(
-            Pos2::new(rect.center().x, dial.max.y + 13.0),
+            Pos2::new(rect.center().x, dial.max.y + 19.0),
             Align2::CENTER_TOP,
             label,
-            FontId::proportional(theme::MICRO),
-            dim(white(95), alpha),
+            theme::caption(),
+            dim(white(89), alpha),
         );
     }
 }

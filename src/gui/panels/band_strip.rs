@@ -105,29 +105,55 @@ pub fn show(
     let rect = Rect::from_min_size(ui.cursor().min, vec2(width, height));
     let mut inner = ui.new_child(
         UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(10.0, 8.0)))
+            .max_rect(rect.shrink2(vec2(12.0, 10.0)))
             .layout(Layout::left_to_right(Align::Min)),
     );
-    inner.spacing_mut().item_spacing = vec2(10.0, 6.0);
+    inner.spacing_mut().item_spacing = vec2(12.0, 6.0);
 
-    chips(&mut inner, bands, selected, height - 16.0);
+    chips(&mut inner, bands, selected, height - 20.0);
 
     let divider = Rect::from_min_size(
-        pos2(rect.min.x + 208.0, rect.min.y + 8.0),
-        vec2(1.0, height - 16.0),
+        pos2(rect.min.x + 212.0, rect.min.y + 10.0),
+        vec2(1.0, height - 20.0),
     );
     ui.painter().rect_filled(divider, 0, white(28));
 
     let editor_rect = Rect::from_min_max(
-        pos2(divider.max.x + 10.0, rect.min.y + 8.0),
-        pos2(rect.max.x - 10.0, rect.max.y - 8.0),
+        pos2(divider.max.x + 12.0, rect.min.y + 10.0),
+        pos2(rect.max.x - 12.0, rect.max.y - 10.0),
     );
+    // A fresh selection fades its panel in and settles it up a few points,
+    // the way the original animated the inspector on selection change. Timed
+    // rather than egui-animated so it replays per change, and skipped in the
+    // headless harness, which renders a handful of passes from t = 0.
+    let anim_id = nih_plug_egui::egui::Id::new("strip-select-anim");
+    let now = ui.input(|i| i.time);
+    let since = {
+        let last = ui
+            .ctx()
+            .data(|d| d.get_temp::<(Option<usize>, f64)>(anim_id));
+        match last {
+            Some((slot, at)) if slot == *selected => at,
+            _ => {
+                ui.ctx()
+                    .data_mut(|d| d.insert_temp(anim_id, (*selected, now)));
+                now
+            }
+        }
+    };
+    let entrance = if cfg!(test) {
+        1.0
+    } else {
+        crate::gui::anim::ease(((now - since) as f32) / 0.24)
+    };
+
     let mut editor = ui.new_child(
         UiBuilder::new()
-            .max_rect(editor_rect)
+            .max_rect(editor_rect.translate(vec2(0.0, 5.0 * (1.0 - entrance))))
             .layout(Layout::top_down(Align::Min)),
     );
     editor.spacing_mut().item_spacing = vec2(8.0, 8.0);
+    editor.set_opacity(entrance);
 
     let index = selected.and_then(|slot| bands.iter().position(|b| b.slot == slot));
     match index {
@@ -160,13 +186,13 @@ fn chips(ui: &mut Ui, bands: &[BandView], selected: &mut Option<usize>, height: 
             .max_rect(rect)
             .layout(Layout::top_down(Align::Min)),
     );
-    column.spacing_mut().item_spacing = vec2(5.0, 5.0);
+    column.spacing_mut().item_spacing = vec2(6.0, 6.0);
 
     // Wrapped in the column rather than in a child with its own rectangle, so
     // the count below lands directly under the last row of chips instead of at
     // the bottom of whatever space the panel happens to have.
     column.horizontal_wrapped(|grid| {
-        grid.spacing_mut().item_spacing = vec2(5.0, 5.0);
+        grid.spacing_mut().item_spacing = vec2(6.0, 6.0);
         if bands.is_empty() {
             grid.label(
                 nih_plug_egui::egui::RichText::new("No bands yet")
@@ -188,7 +214,7 @@ fn chips(ui: &mut Ui, bands: &[BandView], selected: &mut Option<usize>, height: 
             MAX_BANDS,
             if full { " — limit reached" } else { "" }
         ))
-        .font(FontId::proportional(theme::MICRO))
+        .font(theme::caption())
         .color(if full { NEON } else { white(64) }),
     );
 
@@ -200,7 +226,7 @@ fn chips(ui: &mut Ui, bands: &[BandView], selected: &mut Option<usize>, height: 
 fn chip(ui: &mut Ui, band: &BandView, index: usize, selected: &mut Option<usize>) {
     let color = band_color(index);
     let active = *selected == Some(band.slot);
-    let (rect, response) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), Sense::click());
 
     let corner = theme::corner(theme::R_CHIP);
     if active {
@@ -236,7 +262,7 @@ fn chip(ui: &mut Ui, band: &BandView, index: usize, selected: &mut Option<usize>
         rect.center(),
         Align2::CENTER_CENTER,
         format!("{}", index + 1),
-        FontId::proportional(theme::SMALL),
+        theme::semibold(theme::SMALL),
         fg,
     );
     if band.dynamic && band.can_be_dynamic() {
@@ -279,32 +305,38 @@ fn filter_row(
     selected: &mut Option<usize>,
 ) {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
+        // `gap-4` between the row's groups in the original.
+        ui.spacing_mut().item_spacing.x = 16.0;
 
         // --- filter shape ------------------------------------------------
-        for (kind, label) in KINDS.iter().zip(KIND_LABELS) {
-            let on = band.kind == *kind;
-            let (rect, response) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
-            chrome::pill_bg(
-                ui,
-                rect,
-                10.0,
-                if on { Fill::Lit } else { Fill::Quiet },
-                response.hovered(),
-            );
-            ui.painter().add(glyph::shape(
-                *kind,
-                rect.shrink(7.0),
-                if on { color } else { white(115) },
-                1.6,
-            ));
-            if response.clicked() {
-                edit::set_kind(frame, band.slot, *kind);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (kind, label) in KINDS.iter().zip(KIND_LABELS) {
+                let on = band.kind == *kind;
+                let (rect, response) = ui.allocate_exact_size(vec2(32.0, 32.0), Sense::click());
+                let hover =
+                    crate::gui::anim::state(ui.ctx(), response.id, response.hovered(), 0.16);
+                chrome::pill_bg(
+                    ui,
+                    rect,
+                    12.0,
+                    if on { Fill::Lit } else { Fill::Quiet },
+                    hover,
+                );
+                ui.painter().add(glyph::shape(
+                    *kind,
+                    rect.shrink(6.0),
+                    if on { color } else { white(115) },
+                    1.6,
+                ));
+                if response.clicked() {
+                    edit::set_kind(frame, band.slot, *kind);
+                }
+                response.on_hover_text(label);
             }
-            response.on_hover_text(label);
-        }
+        });
 
-        chrome::divider(ui, 30.0);
+        chrome::divider(ui, 40.0);
 
         // --- the four knobs ----------------------------------------------
         let gain_fmt = |v: f32| format!("{}{:.1} dB", if v >= 0.0 { "+" } else { "" }, v);
@@ -352,13 +384,13 @@ fn filter_row(
         // --- slope --------------------------------------------------------
         let is_cut = band.kind.is_cut();
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.spacing_mut().item_spacing.y = 4.0;
             chrome::caption(ui, "Slope");
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.spacing_mut().item_spacing.x = 4.0;
                 for slope in SLOPES {
                     let on = band.slope == slope;
-                    let response = chrome::pill_sized(
+                    let response = chrome::pill_compact(
                         ui,
                         &format!("{}", slope.db_per_oct()),
                         if !is_cut {
@@ -368,7 +400,8 @@ fn filter_row(
                         } else {
                             Fill::Quiet
                         },
-                        Some(26.0),
+                        Some(28.0),
+                        23.0,
                     );
                     if response.clicked() && is_cut {
                         edit::set_slope(frame, band.slot, slope);
@@ -377,39 +410,47 @@ fn filter_row(
             });
             ui.label(
                 nih_plug_egui::egui::RichText::new("dB / oct")
-                    .font(FontId::proportional(theme::MICRO))
+                    .font(theme::caption())
                     .color(white(if is_cut { 64 } else { 26 })),
             );
         });
 
         // --- channel ------------------------------------------------------
         ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.spacing_mut().item_spacing.y = 4.0;
             chrome::caption(ui, "Channel");
             let labels: Vec<&str> = CHANNELS.iter().map(|(_, short, _)| *short).collect();
             let current = CHANNELS
                 .iter()
                 .position(|(c, _, _)| *c == band.channel)
                 .unwrap_or(0);
-            if let Some(i) = chrome::segmented(ui, &labels, current, color, 26.0) {
+            if let Some(i) = chrome::segmented(
+                ui,
+                &labels,
+                current,
+                color,
+                28.0,
+                27.0,
+                FontId::proportional(theme::TINY),
+            ) {
                 edit::set_channel(frame, band.slot, CHANNELS[i].0);
             }
             ui.label(
                 nih_plug_egui::egui::RichText::new("L/R · mid/side")
-                    .font(FontId::proportional(theme::MICRO))
+                    .font(theme::caption())
                     .color(white(64)),
             );
         });
 
         // --- on / solo / delete, pinned right ------------------------------
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            if chrome::pill(ui, "Del", Fill::Quiet).clicked() {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            if chrome::pill_upper(ui, "Del", Fill::Quiet).clicked() {
                 edit::remove_band(frame, band.slot);
                 *selected = None;
             }
             let soloed = frame.transient.solo() == Some(band.slot);
-            let solo = chrome::pill(
+            let solo = chrome::pill_upper(
                 ui,
                 "Solo",
                 if soloed { Fill::Solid(MOCHI) } else { Fill::Quiet },
@@ -420,7 +461,7 @@ fn filter_row(
                     .set_solo(if soloed { None } else { Some(band.slot) });
             }
             solo.on_hover_text("Solo this band — or right-drag its handle on the display");
-            if chrome::pill(
+            if chrome::pill_upper(
                 ui,
                 if band.enabled { "On" } else { "Off" },
                 if band.enabled { Fill::Lit } else { Fill::Quiet },
@@ -439,28 +480,29 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
 
     let outer = Rect::from_min_size(
         ui.cursor().min,
-        vec2(ui.available_width(), 54.0),
+        vec2(ui.available_width(), 100.0),
     );
-    ui.painter().rect(
-        outer,
-        theme::corner(14),
-        white(10),
-        Stroke::new(1.0, white(16)),
-        nih_plug_egui::egui::epaint::StrokeKind::Inside,
-    );
+    // Recessed smoked glass, set into the inspector rather than floating on
+    // it. An armed section lets a little more of the accent into the body.
+    let mut style = crate::gui::gpu::Glass::recessed();
+    if on {
+        style.rose = 0.015;
+        style.edge_reflection *= 1.3;
+    }
+    chrome::glass_panel(ui, frame.fx, outer, style);
 
     let mut row = ui.new_child(
         UiBuilder::new()
-            .max_rect(outer.shrink2(vec2(10.0, 12.0)))
+            .max_rect(outer.shrink2(vec2(10.0, 8.0)))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    row.spacing_mut().item_spacing.x = 8.0;
+    row.spacing_mut().item_spacing.x = 12.0;
 
-    let toggle = chrome::pill(
+    let toggle = chrome::pill_upper(
         &mut row,
         "Dyn",
         if on {
-            Fill::Solid(color)
+            Fill::Tinted(color)
         } else if allowed {
             Fill::Quiet
         } else {
@@ -476,27 +518,26 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
         "Dynamics need a band with gain (bell or shelf)"
     });
 
+    // Everything past the switch stays on screen but goes dim and inert until
+    // the section is armed — the original dimmed it and dropped its pointer
+    // events rather than swapping it for a message. The dim eases both ways.
+    let lit = crate::gui::anim::state(ui.ctx(), ui.id().with("dyn-lit"), on, 0.2);
     if !on {
-        // Everything past the switch is inert until the section is armed; the
-        // original dimmed it and dropped its pointer events, which is this.
-        row.painter().text(
-            pos2(row.cursor().min.x + 8.0, outer.center().y),
-            Align2::LEFT_CENTER,
-            if allowed {
-                "Off — the band holds the gain it is drawn at"
-            } else {
-                "Only a bell or a shelf has a gain to move"
-            },
-            FontId::proportional(theme::TINY),
-            white(60),
-        );
-        ui.allocate_rect(outer, Sense::hover());
-        return;
+        row.disable();
     }
+    row.set_opacity(0.25 + 0.75 * lit);
 
     let modes = ["above", "below"];
     let current = if band.dyn_mode == DynMode::Above { 0 } else { 1 };
-    if let Some(i) = chrome::segmented(&mut row, &modes, current, white(38), 40.0) {
+    if let Some(i) = chrome::segmented(
+        &mut row,
+        &modes,
+        current,
+        white(38),
+        44.0,
+        27.0,
+        FontId::proportional(theme::TINY),
+    ) {
         edit::set_dyn_mode(
             frame,
             band.slot,
@@ -511,7 +552,6 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
     if let Some(v) = Knob::new("Range", band.dyn_range, -30.0, 30.0, &db)
         .default_value(-6.0)
         .color(color)
-        .size(34.0)
         .show(&mut row)
     {
         edit::set_dyn_range(frame, band.slot, v);
@@ -519,7 +559,6 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
     if let Some(v) = Knob::new("Thresh", band.threshold, -70.0, 0.0, &thresh)
         .default_value(-24.0)
         .color(color)
-        .size(34.0)
         .show(&mut row)
     {
         edit::set_threshold(frame, band.slot, v);
@@ -528,7 +567,6 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
         .log(true)
         .default_value(20.0)
         .color(color)
-        .size(34.0)
         .show(&mut row)
     {
         edit::set_attack(frame, band.slot, v);
@@ -537,7 +575,6 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
         .log(true)
         .default_value(200.0)
         .color(color)
-        .size(34.0)
         .show(&mut row)
     {
         edit::set_release(frame, band.slot, v);
@@ -551,8 +588,8 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
 fn dyn_meter(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
     let width = ui.available_width().clamp(130.0, 260.0);
     let rect = Rect::from_min_size(
-        pos2(ui.cursor().min.x, ui.max_rect().center().y - 16.0),
-        vec2(width, 32.0),
+        pos2(ui.cursor().min.x, ui.max_rect().center().y - 19.0),
+        vec2(width, 38.0),
     );
 
     let level = frame.level.get(band.slot).copied().unwrap_or(METER_MIN);
@@ -564,34 +601,34 @@ fn dyn_meter(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
         pos2(rect.min.x, rect.min.y),
         Align2::LEFT_TOP,
         crate::gui::widgets::menu::spaced("Band level"),
-        FontId::proportional(theme::MICRO),
-        white(95),
+        theme::caption(),
+        white(89),
     );
     painter.text(
         pos2(rect.max.x, rect.min.y),
         Align2::RIGHT_TOP,
         format!("{}{:.1} dB", if delta >= 0.0 { "+" } else { "" }, delta),
-        FontId::proportional(theme::MICRO),
-        white(180),
+        theme::caption(),
+        white(178),
     );
 
     chrome::meter(
         ui,
-        Rect::from_min_size(pos2(rect.min.x, rect.min.y + 13.0), vec2(width, 6.0)),
+        Rect::from_min_size(pos2(rect.min.x, rect.min.y + 15.0), vec2(width, 8.0)),
         to_fraction(level),
         Some(to_fraction(band.threshold)),
         color,
     );
 
     ui.painter().text(
-        pos2(rect.min.x, rect.max.y - 8.0),
+        pos2(rect.min.x, rect.max.y - 6.0),
         Align2::LEFT_CENTER,
         if band.dyn_mode == DynMode::Above {
             "engages above threshold"
         } else {
             "engages below threshold"
         },
-        FontId::proportional(theme::MICRO),
+        theme::caption(),
         white(64),
     );
     ui.allocate_rect(rect, Sense::hover());

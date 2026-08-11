@@ -4,9 +4,11 @@
 //! Everything the UI draws comes from here, so there is one place to change a
 //! colour and one place that decides how large "small text" is.
 
+use std::sync::Arc;
+
 use nih_plug_egui::egui::{
-    epaint, style::Selection, Color32, CornerRadius, FontFamily, FontId, Stroke, Style, TextStyle,
-    Visuals,
+    epaint, style::Selection, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
+    Stroke, Style, TextStyle, Visuals,
 };
 
 /// Hot signal pink. Anything actively shaping the sound is drawn in this.
@@ -62,6 +64,19 @@ pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     Color32::from_rgb(lerp(a.r(), b.r()), lerp(a.g(), b.g()), lerp(a.b(), b.b()))
 }
 
+/// The same, alpha included — what a hover fade interpolates through. Both
+/// ends are premultiplied, so channel-wise interpolation stays premultiplied.
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        lerp(a.r(), b.r()),
+        lerp(a.g(), b.g()),
+        lerp(a.b(), b.b()),
+        lerp(a.a(), b.a()),
+    )
+}
+
 // --- type scale -------------------------------------------------------------
 //
 // The old UI was built on a 9/10/11px scale. egui's default text is much
@@ -85,6 +100,67 @@ pub fn mono(size: f32) -> FontId {
     FontId::new(size, FontFamily::Monospace)
 }
 
+/// The medium cut — captions and control labels, which sit uppercase at 9px
+/// and need the extra weight to hold their colour against the glass.
+pub fn medium(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("mona-medium".into()))
+}
+
+/// The semibold cut — the wordmark and nothing else, so far.
+pub fn semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("mona-semibold".into()))
+}
+
+/// The uppercase micro-caption every control wears.
+pub fn caption() -> FontId {
+    medium(MICRO)
+}
+
+/// The embedded typeface: Mona Sans (SIL OFL 1.1), three static cuts. egui's
+/// bundled fonts stay behind each one in its family, so a glyph Mona Sans does
+/// not carry — the thin space the captions are tracked with, an odd symbol —
+/// falls through to a font that has it instead of drawing an empty box.
+fn fonts() -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
+    for (name, bytes) in [
+        (
+            "MonaSans-Regular",
+            &include_bytes!("../../assets/fonts/MonaSans-Regular.ttf")[..],
+        ),
+        (
+            "MonaSans-Medium",
+            &include_bytes!("../../assets/fonts/MonaSans-Medium.ttf")[..],
+        ),
+        (
+            "MonaSans-SemiBold",
+            &include_bytes!("../../assets/fonts/MonaSans-SemiBold.ttf")[..],
+        ),
+    ] {
+        fonts
+            .font_data
+            .insert(name.to_owned(), Arc::new(FontData::from_static(bytes)));
+    }
+
+    let fallback = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+
+    let proportional = fonts.families.entry(FontFamily::Proportional).or_default();
+    proportional.insert(0, "MonaSans-Regular".to_owned());
+
+    for (family, lead) in [
+        ("mona-medium", "MonaSans-Medium"),
+        ("mona-semibold", "MonaSans-SemiBold"),
+    ] {
+        let mut list = vec![lead.to_owned()];
+        list.extend(fallback.iter().cloned());
+        fonts.families.insert(FontFamily::Name(family.into()), list);
+    }
+    fonts
+}
+
 /// Corner radii, matching the `rounded-*` classes the port came from.
 pub const R_PILL: u8 = 255;
 pub const R_PANEL: u8 = 22;
@@ -97,6 +173,8 @@ pub fn corner(radius: u8) -> CornerRadius {
 
 /// Install the base style. Called once, when the editor is built.
 pub fn apply(ctx: &nih_plug_egui::egui::Context) {
+    ctx.set_fonts(fonts());
+
     let text_styles = [
         (TextStyle::Small, font(MICRO)),
         (TextStyle::Body, font(SMALL)),
