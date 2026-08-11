@@ -15,14 +15,34 @@ jobs:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
-      # One platform failing shouldn't hide whether the other one works.
+      # One platform failing shouldn't hide whether the others work.
       fail-fast: false
       matrix:
         include:
-          - name: windows
+          - name: windows-x86_64
             os: windows-latest
-          - name: macos
+            target: x86_64-pc-windows-msvc
+            test: true
+          # macos-latest runners are arm64, so arm64 is native and x86_64 is a
+          # cross build. Both produce a single-slice bundle; the universal one
+          # below is the build most people actually want to install.
+          - name: macos-arm64
             os: macos-latest
+            target: aarch64-apple-darwin
+            arch_label: arm64
+            test: true
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            arch_label: x86_64
+            # Cross-compiled: the tests would need Rosetta to run here, and the
+            # same tests already run natively on the arm64 job.
+            test: false
+          - name: macos-universal
+            os: macos-latest
+            target: aarch64-apple-darwin,x86_64-apple-darwin
+            arch_label: universal
+            test: false
 
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +54,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          # The macOS bundle is universal, which means building both halves.
-          targets: ${{ matrix.name == 'macos' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -54,34 +73,40 @@ jobs:
           bun run build
 
       - name: Test
+        if: matrix.test
         run: cargo test --workspace
 
-      - name: Bundle (Windows)
-        if: matrix.name == 'windows'
-        run: cargo xtask bundle equzx --release
+      - name: Bundle
+        shell: bash
+        run: |
+          if [ "${{ matrix.name }}" = "macos-universal" ]; then
+            cargo xtask bundle-universal equzx --release
+          else
+            cargo xtask bundle equzx --release --target ${{ matrix.target }}
+          fi
 
-      - name: Bundle (macOS universal)
-        if: matrix.name == 'macos'
-        run: cargo xtask bundle-universal equzx --release
-
-      - name: Check the bundles came out as plug-ins
+      - name: Check the bundles came out as loadable plug-ins
         shell: bash
         run: |
           set -e
           test -d target/bundled/EQUZX.vst3 || { echo "no VST3 bundle"; exit 1; }
-          if [ "${{ matrix.name }}" = "windows" ]; then
+          if [ "${{ runner.os }}" = "Windows" ]; then
             test -f target/bundled/EQUZX.vst3/Contents/x86_64-win/EQUZX.vst3
             test -f target/bundled/EQUZX.clap
           else
-            test -f target/bundled/EQUZX.vst3/Contents/MacOS/EQUZX
+            binary=target/bundled/EQUZX.vst3/Contents/MacOS/EQUZX
+            test -f "$binary"
             test -d target/bundled/EQUZX.clap
-            # Universal means both slices are actually in there.
-            lipo -archs target/bundled/EQUZX.vst3/Contents/MacOS/EQUZX | tee /dev/stderr | grep -q x86_64
-            lipo -archs target/bundled/EQUZX.vst3/Contents/MacOS/EQUZX | grep -q arm64
+            archs="$(lipo -archs "$binary")"
+            echo "slices: $archs"
+            case "${{ matrix.arch_label }}" in
+              universal) echo "$archs" | grep -q x86_64 && echo "$archs" | grep -q arm64 ;;
+              *) echo "$archs" | grep -q "${{ matrix.arch_label }}" ;;
+            esac
           fi
 
       - name: Installer (Windows, Inno Setup)
-        if: matrix.name == 'windows'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
@@ -91,10 +116,10 @@ jobs:
           & $iscc /DVersion=${{ steps.version.outputs.version }} installer\windows\equzx.iss
 
       - name: Installer (macOS, pkg)
-        if: matrix.name == 'macos'
+        if: runner.os == 'macOS'
         run: |
           chmod +x installer/macos/build-pkg.sh
-          installer/macos/build-pkg.sh
+          installer/macos/build-pkg.sh target/bundled target/installer ${{ matrix.arch_label }}
 
       - name: Upload plug-ins
         uses: actions/upload-artifact@v4
@@ -109,20 +134,52 @@ jobs:
           path: target/installer/
 
   release:
-    # Tag pushes publish; everything else just leaves artifacts on the run.
+    # Tag pushes publish; every other run just leaves artifacts attached to it.
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "version=$(python3 -c 'import json; print(json.load(open("version.json"))["version"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse to publish a tag that disagrees with version.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          declared="${{ steps.version.outputs.version }}"
+          if [ "$tag" != "$declared" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version.json ($declared)"
+            exit 1
+          fi
+
       - uses: actions/download-artifact@v4
         with:
           pattern: "*-installer"
           path: installers
           merge-multiple: true
 
+      - name: List what is being published
+        run: ls -lh installers
+
       - uses: softprops/action-gh-release@v2
         with:
           files: installers/*
           generate_release_notes: true
+          body: |
+            **EQUZX ${{ steps.version.outputs.version }}** — VST3 and CLAP.
+
+            | Download | For |
+            | --- | --- |
+            | `EQUZX-${{ steps.version.outputs.version }}-windows.exe` | Windows x86_64 |
+            | `EQUZX-${{ steps.version.outputs.version }}-macos-universal.pkg` | macOS, Apple Silicon and Intel |
+            | `EQUZX-${{ steps.version.outputs.version }}-macos-arm64.pkg` | macOS, Apple Silicon only |
+            | `EQUZX-${{ steps.version.outputs.version }}-macos-x86_64.pkg` | macOS, Intel only |
+
+            Take the universal package unless you have a reason not to. The
+            installers place the plug-ins in the shared system folders; the
+            macOS builds are unsigned, so Gatekeeper will ask before it opens
+            the package.
