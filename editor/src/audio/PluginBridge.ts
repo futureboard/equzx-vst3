@@ -1,5 +1,13 @@
 import type { Band } from '../dsp/bands'
-import { CEIL_DB, FLOOR_DB, type EqEngine, type SpectrumCurve } from './engine'
+import {
+  RES_BANDS,
+  RES_BANDS_PER_OCTAVE,
+  RES_F_LO,
+  RES_MAX_CUT_DB,
+  defaultResonance,
+  type Resonance,
+} from '../dsp/resonance'
+import { CEIL_DB, FLOOR_DB, type EqEngine, type ResonanceCurve, type SpectrumCurve } from './engine'
 
 /**
  * The UI's side of the plugin bridge.
@@ -23,6 +31,14 @@ declare global {
   }
 }
 
+/** The bank's layout, as the plugin reports it alongside its settings. */
+interface ResonanceWire extends Resonance {
+  bands: number
+  fLo: number
+  bandsPerOctave: number
+  maxCut: number
+}
+
 /** Everything the plugin knows that the UI has to mirror. */
 export interface PluginState {
   bands: Band[]
@@ -30,6 +46,7 @@ export interface PluginState {
   bypass: boolean
   sampleRate: number
   maxBands: number
+  resonance: ResonanceWire
   /** Opaque view state the plugin stores with the session. */
   ui: string
 }
@@ -40,6 +57,9 @@ interface FrameMessage {
   post: string
   level: number[]
   delta: number[]
+  /** One byte per resonance band, quantised against the bank's `maxCut`. */
+  res: string
+  resPeak: number
 }
 
 interface StateMessage extends PluginState {
@@ -77,6 +97,15 @@ export class PluginBridge implements EqEngine {
   private postReady = false
   private levels: number[] = []
   private deltas: number[] = []
+
+  private resDb = new Float32Array(RES_BANDS)
+  private resPeak = 0
+  /** Layout of the bank, replaced by whatever the plugin reports. */
+  private resLayout = {
+    fLo: RES_F_LO,
+    bandsPerOctave: RES_BANDS_PER_OCTAVE,
+    maxCut: RES_MAX_CUT_DB,
+  }
 
   private stateListeners = new Set<(state: PluginState) => void>()
 
@@ -116,6 +145,16 @@ export class PluginBridge implements EqEngine {
     return this.levels[id] ?? -100
   }
 
+  getResonance(): ResonanceCurve | null {
+    if (this.resPeak <= 0) return null
+    return {
+      db: this.resDb,
+      fLo: this.resLayout.fLo,
+      bandsPerOctave: this.resLayout.bandsPerOctave,
+      peak: this.resPeak,
+    }
+  }
+
   // --- actions -----------------------------------------------------------
 
   addBand(slot: number, band: Partial<Band>) {
@@ -142,13 +181,24 @@ export class PluginBridge implements EqEngine {
     this.send({ type: 'outputGain', value })
   }
 
-  /** Replace every band at once — an A/B swap, a preset recall, a reset. */
-  loadState(bands: Band[], outputGain: number) {
+  /**
+   * Replace every band at once — an A/B swap, a preset recall, a reset.
+   *
+   * The resonance settings travel with it rather than as a second message, so
+   * the plugin never spends a frame with one preset's bands and another's
+   * suppressor.
+   */
+  loadState(bands: Band[], outputGain: number, resonance?: Partial<Resonance>) {
     this.send({
       type: 'loadState',
       outputGain,
+      resonance,
       bands: bands.map((band, i) => ({ slot: band.id ?? i, ...wire(band) })),
     })
+  }
+
+  setResonance(patch: Partial<Resonance>) {
+    this.send({ type: 'resonance', value: patch })
   }
 
   setUiState(value: string) {
@@ -180,22 +230,46 @@ export class PluginBridge implements EqEngine {
       this.postReady = decodeCurve(m.post, this.postDb)
       this.levels = m.level
       this.deltas = m.delta
+      this.resPeak = m.resPeak ?? 0
+      this.decodeResonance(m.res)
       return
     }
 
     if (m.type === 'state') {
       this.sampleRate = m.sampleRate
       this.maxBands = m.maxBands
+      if (m.resonance) {
+        this.resLayout = {
+          fLo: m.resonance.fLo,
+          bandsPerOctave: m.resonance.bandsPerOctave,
+          maxCut: m.resonance.maxCut,
+        }
+        if (this.resDb.length !== m.resonance.bands) {
+          this.resDb = new Float32Array(m.resonance.bands)
+        }
+      }
       const state: PluginState = {
         bands: m.bands,
         outputGain: m.outputGain,
         bypass: m.bypass,
         sampleRate: m.sampleRate,
         maxBands: m.maxBands,
+        resonance: m.resonance ?? { ...defaultResonance(), ...this.resLayout, bands: RES_BANDS },
         ui: m.ui,
       }
       for (const listener of this.stateListeners) listener(state)
     }
+  }
+
+  private decodeResonance(b64: string) {
+    if (!b64) {
+      this.resDb.fill(0)
+      return
+    }
+    const bin = atob(b64)
+    if (this.resDb.length !== bin.length) this.resDb = new Float32Array(bin.length)
+    const scale = this.resLayout.maxCut / 255
+    for (let i = 0; i < bin.length; i++) this.resDb[i] = bin.charCodeAt(i) * scale
   }
 }
 
@@ -224,5 +298,6 @@ function wire(band: Partial<Band>): Record<string, unknown> {
   copy('threshold')
   copy('attack')
   copy('release')
+  copy('resonance')
   return out
 }

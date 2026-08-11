@@ -25,14 +25,24 @@
 //! smoothed parameter values, and the dynamics envelope advances on the same
 //! grid. At 48 kHz that is a 0.67 ms grid — fine enough that parameter moves
 //! are inaudible, coarse enough that the trig in the coefficient formulas
-//! doesn't dominate.
+//! doesn't dominate. The envelope loses nothing to that grid: its one-pole is
+//! solved exactly for a target held constant across the block, which is what a
+//! target built from control-rate settings always is.
+//!
+//! Level *detection*, though, runs at audio rate — see
+//! [`crate::dsp::dynamics::LevelDetector`]. A block is a fraction of a cycle at
+//! the bottom of the range, so a level taken block by block is a reading of the
+//! waveform rather than of its loudness.
 //!
 //! The engine deliberately knows nothing about [`crate::params`] types beyond
 //! the plain enums: it is driven by a [`Settings`] snapshot, which
 //! [`settings_for_block`] builds once per block from the parameters.
 
 use crate::dsp::biquad::{butterworth_qs, Biquad, Coeffs, MAX_SECTIONS};
-use crate::dsp::dynamics::{dynamic_step, ms_to_db, DynSettings};
+use crate::dsp::dynamics::{dynamic_step, step_toward, DynSettings, LevelDetector};
+use crate::dsp::resonance::{
+    band_freq, band_region_weight, ResonanceBank, ResonanceSettings, RES_BANDS,
+};
 use crate::params::{
     BandChannel, BandKind, Domain, DynMode, EquzxParams, TransientState, MAX_BANDS,
 };
@@ -59,6 +69,8 @@ pub struct BandPlan {
     pub threshold: f32,
     pub attack: f32,
     pub release: f32,
+    /// Adaptive resonance suppression inside this band's own region, 0..1.
+    pub resonance: f32,
 }
 
 impl Default for BandPlan {
@@ -77,6 +89,7 @@ impl Default for BandPlan {
             threshold: -24.0,
             attack: 20.0,
             release: 200.0,
+            resonance: 0.0,
         }
     }
 }
@@ -88,6 +101,7 @@ pub struct Settings {
     pub output_gain_db: f32,
     pub bypass: bool,
     pub solo: Option<usize>,
+    pub resonance: ResonanceSettings,
 }
 
 impl Default for Settings {
@@ -97,6 +111,7 @@ impl Default for Settings {
             output_gain_db: 0.0,
             bypass: false,
             solo: None,
+            resonance: ResonanceSettings::default(),
         }
     }
 }
@@ -114,11 +129,24 @@ pub fn settings_for_block(
     let steps = n as u32;
     let nyquist = sr / 2.0 - 1.0;
 
+    let res = &params.resonance;
     let mut settings = Settings {
         bands: [BandPlan::default(); MAX_BANDS],
         output_gain_db: params.output_gain.smoothed.next_step(steps),
         bypass: params.bypass.value(),
         solo: transient.solo(),
+        resonance: ResonanceSettings {
+            enabled: res.enabled.value(),
+            depth: res.depth.smoothed.next_step(steps),
+            sharpness: res.sharpness.smoothed.next_step(steps),
+            threshold_db: res.threshold.smoothed.next_step(steps),
+            attack_ms: res.attack.value(),
+            release_ms: res.release.value(),
+            low_hz: res.low.smoothed.next_step(steps),
+            high_hz: res.high.smoothed.next_step(steps),
+            mix: res.mix.smoothed.next_step(steps),
+            delta: res.delta.value(),
+        },
     };
 
     for (plan, p) in settings.bands.iter_mut().zip(params.bands.iter()) {
@@ -127,6 +155,7 @@ pub fn settings_for_block(
         let q = p.q.smoothed.next_step(steps);
         let dyn_range = p.dyn_range.smoothed.next_step(steps);
         let threshold = p.threshold.smoothed.next_step(steps);
+        let resonance = p.resonance.smoothed.next_step(steps);
         let kind = p.kind.value();
 
         *plan = BandPlan {
@@ -145,6 +174,7 @@ pub fn settings_for_block(
             threshold,
             attack: p.attack.value(),
             release: p.release.value(),
+            resonance,
         };
     }
 
@@ -187,10 +217,16 @@ struct BandRuntime {
     bus_b: [Biquad; MAX_SECTIONS],
     key: CoeffKey,
 
-    /// Sidechain filter isolating the region this band acts on.
+    /// Sidechain filter isolating the region this band acts on. One per bus, so
+    /// a band routed to both hears both — an anti-phase pair is silent summed to
+    /// mono while still being filtered at full level on each side.
     det_coeffs: Coeffs,
-    det: Biquad,
+    det_a: Biquad,
+    det_b: Biquad,
     det_key: CoeffKey,
+    /// Integrates the sidechain into a level that means something at the band's
+    /// own frequency, rather than one control block's worth of waveform.
+    level: LevelDetector,
     env: f32,
 
     /// Gain offset the dynamics section is currently applying, in dB.
@@ -214,8 +250,10 @@ impl Default for BandRuntime {
             bus_b: [Biquad::new(); MAX_SECTIONS],
             key: CoeffKey::NONE,
             det_coeffs: Coeffs::identity(),
-            det: Biquad::new(),
+            det_a: Biquad::new(),
+            det_b: Biquad::new(),
             det_key: CoeffKey::NONE,
+            level: LevelDetector::new(),
             env: 0.0,
             delta_db: 0.0,
             level_db: -100.0,
@@ -227,11 +265,24 @@ impl Default for BandRuntime {
 }
 
 impl BandRuntime {
-    fn reset(&mut self) {
+    /// Drop the delay lines of the band's own filters, and nothing else.
+    ///
+    /// This is what a routing change calls for: the state describes a signal the
+    /// band is no longer looking at, but the sidechain taps the input and never
+    /// did care which domain the chain is in, so its level and envelope are
+    /// still current. Wiping those too would drop the gain offset to zero for a
+    /// block — an audible step, on a change the user made for other reasons.
+    fn reset_filters(&mut self) {
         for s in self.bus_a.iter_mut().chain(self.bus_b.iter_mut()) {
             s.reset();
         }
-        self.det.reset();
+    }
+
+    fn reset(&mut self) {
+        self.reset_filters();
+        self.det_a.reset();
+        self.det_b.reset();
+        self.level.reset();
         self.env = 0.0;
         self.delta_db = 0.0;
         self.level_db = -100.0;
@@ -298,11 +349,17 @@ impl BandRuntime {
     /// The sidechain listens through the slice of spectrum the band acts on:
     /// a shelf hears everything on its side of the corner, a bell hears its bump.
     fn update_detector(&mut self, kind: BandKind, freq: f32, q: f32, sr: f32) {
+        // A detector as narrow as a band is allowed to be — Q goes to 40 — is an
+        // oscillator rather than a meter: it rings for the best part of a second
+        // and reads next to nothing off real material, so the surgical bands
+        // that most want dynamics would be the ones that never engaged. Widen
+        // the listening filter without widening the band it drives.
+        let det_q = q.clamp(0.5, 4.0);
         let key = CoeffKey {
             kind: kind as u8,
             order: 0,
             freq,
-            q,
+            q: det_q,
             gain: 0.0,
         };
         if key == self.det_key {
@@ -312,7 +369,7 @@ impl BandRuntime {
         self.det_coeffs = match kind {
             BandKind::LowShelf => Coeffs::lowpass(freq, 1.0, sr),
             BandKind::HighShelf => Coeffs::highpass(freq, 1.0, sr),
-            _ => Coeffs::bandpass(freq, q.max(0.5), sr),
+            _ => Coeffs::bandpass(freq, det_q, sr),
         };
     }
 
@@ -350,6 +407,11 @@ pub struct BandMeter {
 pub struct EqEngine {
     sr: f32,
     bands: Box<[BandRuntime; MAX_BANDS]>,
+    /// Runs after the bands, on whatever they left behind.
+    resonance: Box<ResonanceBank>,
+    /// Suppression the EQ's own bands are asking for, per bank band. Rebuilt
+    /// each block and owned here so `process_block` never allocates.
+    res_band_depth: Box<[f32; RES_BANDS]>,
     /// Solo listens through the band's own region, applied after the decode.
     solo_coeffs: Coeffs,
     solo_key: CoeffKey,
@@ -360,7 +422,9 @@ pub struct EqEngine {
     /// arrived rather than as earlier bands left it.
     pre_l: [f32; CONTROL_BLOCK],
     pre_r: [f32; CONTROL_BLOCK],
-    det_buf: [f32; CONTROL_BLOCK],
+    /// What the band about to be metered is listening to, one buffer per bus.
+    sc_a: [f32; CONTROL_BLOCK],
+    sc_b: [f32; CONTROL_BLOCK],
 }
 
 /// Move a stereo pair between the two domains, in place.
@@ -399,13 +463,16 @@ impl EqEngine {
         Self {
             sr,
             bands: Box::new(std::array::from_fn(|_| BandRuntime::default())),
+            resonance: Box::new(ResonanceBank::new(sr)),
+            res_band_depth: Box::new([0.0; RES_BANDS]),
             solo_coeffs: Coeffs::identity(),
             solo_key: CoeffKey::NONE,
             solo_l: Biquad::new(),
             solo_r: Biquad::new(),
             pre_l: [0.0; CONTROL_BLOCK],
             pre_r: [0.0; CONTROL_BLOCK],
-            det_buf: [0.0; CONTROL_BLOCK],
+            sc_a: [0.0; CONTROL_BLOCK],
+            sc_b: [0.0; CONTROL_BLOCK],
         }
     }
 
@@ -423,6 +490,7 @@ impl EqEngine {
             }
             self.solo_key = CoeffKey::NONE;
         }
+        self.resonance.set_sample_rate(sr);
         self.reset();
     }
 
@@ -430,6 +498,7 @@ impl EqEngine {
         for band in self.bands.iter_mut() {
             band.reset();
         }
+        self.resonance.reset();
         self.solo_l.reset();
         self.solo_r.reset();
         self.solo_key = CoeffKey::NONE;
@@ -441,6 +510,16 @@ impl EqEngine {
             level_db: band.level_db,
             delta_db: band.delta_db,
         }
+    }
+
+    /// dB of cut each resonance band is applying, for the UI.
+    pub fn resonance_reduction(&self, out: &mut [f32]) {
+        self.resonance.reduction(out);
+    }
+
+    /// The deepest cut the resonance stage is making anywhere, in dB.
+    pub fn resonance_peak(&self) -> f32 {
+        self.resonance.peak_reduction()
     }
 
     /// Process one control block in place.
@@ -467,6 +546,9 @@ impl EqEngine {
                     band.ran_domain = None;
                 }
             }
+            if self.resonance.peak_reduction() != 0.0 {
+                self.resonance.reset();
+            }
             return;
         }
 
@@ -491,34 +573,68 @@ impl EqEngine {
             let p = s.bands[slot];
             let band = &mut self.bands[slot];
 
-            if !p.running || !p.dynamic {
+            if !p.running {
+                // The band is out of the chain entirely; there is no gain for an
+                // offset to sit on, so nothing has to be let down gently.
                 band.delta_db = 0.0;
                 band.env = 0.0;
                 band.level_db = -100.0;
+                band.level.reset();
+                continue;
+            }
+
+            if !p.dynamic {
+                // Still audible, just no longer moving. Walk any offset out at
+                // the release time rather than dropping it: switching dynamics
+                // off part-way through a gain reduction is one click of a button
+                // and shouldn't also be one click in the audio. Bands that were
+                // never dynamic — most of them, most of the time — are already
+                // at rest and skip the whole thing.
+                if band.env != 0.0 {
+                    band.env = step_toward(band.env, 0.0, p.release, dt);
+                    band.delta_db = band.env * p.dyn_range;
+                } else {
+                    band.delta_db = 0.0;
+                }
+                band.level_db = -100.0;
+                band.level.reset();
                 continue;
             }
 
             // Each band listens to the signal it actually filters. A stereo band
-            // hears the mono sum, which is the mid bus.
+            // filters left and right alike, so it listens to both — folding them
+            // to the mono sum first would leave an anti-phase pair silent to the
+            // detector while the band was working on it at full level.
+            let both_buses = matches!(p.channel, BandChannel::Stereo);
             for i in 0..n {
                 let (l, r) = (self.pre_l[i], self.pre_r[i]);
-                self.det_buf[i] = match p.channel {
-                    BandChannel::Left => l,
-                    BandChannel::Right => r,
-                    BandChannel::Side => 0.5 * (l - r),
-                    BandChannel::Mid | BandChannel::Stereo => 0.5 * (l + r),
-                };
+                match p.channel {
+                    BandChannel::Left => self.sc_a[i] = l,
+                    BandChannel::Right => self.sc_a[i] = r,
+                    BandChannel::Mid => self.sc_a[i] = 0.5 * (l + r),
+                    BandChannel::Side => self.sc_a[i] = 0.5 * (l - r),
+                    BandChannel::Stereo => {
+                        self.sc_a[i] = l;
+                        self.sc_b[i] = r;
+                    }
+                }
             }
 
             band.update_detector(p.kind, p.freq, p.q, sr);
+            band.level.set_window(p.freq, sr);
             let c = band.det_coeffs;
-            let mut sum = 0.0f32;
-            for x in self.det_buf[..n].iter_mut() {
-                let y = band.det.process(*x, &c);
-                *x = y;
-                sum += y * y;
+            if both_buses {
+                for i in 0..n {
+                    let a = band.det_a.process(self.sc_a[i], &c);
+                    let b = band.det_b.process(self.sc_b[i], &c);
+                    band.level.push_ms(0.5 * (a * a + b * b));
+                }
+            } else {
+                for i in 0..n {
+                    band.level.push(band.det_a.process(self.sc_a[i], &c));
+                }
             }
-            band.level_db = ms_to_db(sum / n as f32);
+            band.level_db = band.level.level_db();
 
             let (env, delta) = dynamic_step(
                 DynSettings {
@@ -567,7 +683,7 @@ impl EqEngine {
             // click, and so is state that describes the other domain's signal.
             let domain_changed = band.ran_domain.is_some_and(|was| was != domain);
             if (band.ran_a && !run_a) || (band.ran_b && !run_b) || domain_changed {
-                band.reset();
+                band.reset_filters();
             }
             band.ran_a = run_a;
             band.ran_b = run_b;
@@ -612,6 +728,23 @@ impl EqEngine {
             }
         }
 
+        // --- resonance suppression -------------------------------------------
+        // Last in the chain and in left/right, because it is judging the signal
+        // as it will be heard — including whatever the bands just did to it.
+        // Soloing is a way of hearing one band plainly, so a suppressor chewing
+        // on the thing being listened for would defeat the point.
+        if s.solo.is_none() {
+            self.plan_band_resonance(s);
+            self.resonance.process(
+                &mut left[..n],
+                right.as_deref_mut().map(|r| &mut r[..n]),
+                &s.resonance,
+                &self.res_band_depth[..],
+            );
+        } else if self.resonance.peak_reduction() != 0.0 {
+            self.resonance.reset();
+        }
+
         let out_gain = 10f32.powf(s.output_gain_db / 20.0);
         for x in left[..n].iter_mut() {
             *x *= out_gain;
@@ -629,6 +762,34 @@ impl EqEngine {
                 self.apply_solo(plan, left, right.as_deref_mut(), n);
             }
             None => self.clear_solo(),
+        }
+    }
+
+    /// Spread each band's own resonance amount over the bank bands it covers.
+    ///
+    /// A band asking for suppression is asking for it *in its own region*, so
+    /// what reaches the bank is the amount shaped by that region — see
+    /// [`band_region_weight`]. Overlapping bands add, because two bands pointed
+    /// at the same spot both wanting it gone is not a reason to want it gone
+    /// less; the sum is capped by the bank.
+    fn plan_band_resonance(&mut self, s: &Settings) {
+        let any = s.bands.iter().any(|p| p.running && p.resonance > 0.0);
+        if !any {
+            // Nothing to spread, and the bank reads this to decide whether it
+            // has any reason to run at all.
+            self.res_band_depth.fill(0.0);
+            return;
+        }
+        for (i, slot) in self.res_band_depth.iter_mut().enumerate() {
+            let freq = band_freq(i);
+            let mut depth = 0.0;
+            for p in s.bands.iter() {
+                if !p.running || p.resonance <= 0.0 {
+                    continue;
+                }
+                depth += p.resonance * band_region_weight(p.kind, p.freq, p.q, freq);
+            }
+            *slot = depth;
         }
     }
 
@@ -1214,6 +1375,193 @@ mod tests {
         assert!(engine.meter(0).delta_db.abs() < 0.01);
     }
 
+    /// Feed a mono tone at `freq` for `blocks` blocks and report the min and max
+    /// gain offset the band settled on over the second half of the run.
+    fn delta_swing(engine: &mut EqEngine, s: &Settings, freq: f32, blocks: usize) -> (f32, f32) {
+        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+        for block in 0..blocks {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            let mut r = [0.0f32; CONTROL_BLOCK];
+            for i in 0..CONTROL_BLOCK {
+                let t = (block * CONTROL_BLOCK + i) as f32 / SR;
+                let x = (2.0 * PI * freq * t).sin();
+                l[i] = x;
+                r[i] = x;
+            }
+            engine.process_block(&mut l, Some(&mut r), s);
+            if block >= blocks / 2 {
+                let d = engine.meter(0).delta_db;
+                lo = lo.min(d);
+                hi = hi.max(d);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// A 50 Hz cycle is 960 samples — thirty control blocks. A level taken one
+    /// block at a time is therefore a reading of the waveform, and a band with a
+    /// fast attack follows it: the gain modulates at the tone's own rate, which
+    /// is distortion rather than dynamics. The threshold sits half a knee below
+    /// the tone so a wobble in the level would show up undiluted by the clamp.
+    #[test]
+    fn a_low_band_holds_a_steady_offset_on_a_steady_tone() {
+        let mut engine = EqEngine::new(SR);
+        let s = one_band(BandPlan {
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: SINE_RMS_DB - crate::params::DYN_KNEE_DB / 2.0,
+            attack: 1.0,
+            release: 10.0,
+            ..bell(50.0, 0.0, 1.0)
+        });
+
+        let (lo, hi) = delta_swing(&mut engine, &s, 50.0, 800);
+        // Half a knee in is half the range.
+        assert!(
+            (lo + 6.0).abs() < 1.5 && (hi + 6.0).abs() < 1.5,
+            "offset settled at {lo}..{hi} dB, expected about -6"
+        );
+        assert!(hi - lo < 1.5, "the offset wobbled over {} dB", hi - lo);
+    }
+
+    /// The same at the top of the range, where the old block-at-a-time reading
+    /// happened to work — the fix must not have cost anything up here.
+    #[test]
+    fn a_high_band_holds_a_steady_offset_too() {
+        let mut engine = EqEngine::new(SR);
+        let s = one_band(BandPlan {
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: SINE_RMS_DB - crate::params::DYN_KNEE_DB / 2.0,
+            attack: 1.0,
+            release: 10.0,
+            ..bell(6000.0, 0.0, 1.0)
+        });
+
+        let (lo, hi) = delta_swing(&mut engine, &s, 6000.0, 400);
+        assert!(
+            (lo + 6.0).abs() < 1.0 && (hi + 6.0).abs() < 1.0,
+            "offset settled at {lo}..{hi} dB, expected about -6"
+        );
+        assert!(hi - lo < 1.0, "the offset wobbled over {} dB", hi - lo);
+    }
+
+    /// A stereo band filters both channels, so it has to hear both. An
+    /// anti-phase pair is silent summed to mono and full scale on each side.
+    #[test]
+    fn a_dynamic_stereo_band_hears_an_anti_phase_pair() {
+        let mut engine = EqEngine::new(SR);
+        let s = one_band(BandPlan {
+            channel: BandChannel::Stereo,
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: -30.0,
+            attack: 1.0,
+            release: 10.0,
+            ..bell(1000.0, 0.0, 1.0)
+        });
+
+        for block in 0..400 {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            let mut r = [0.0f32; CONTROL_BLOCK];
+            for i in 0..CONTROL_BLOCK {
+                let t = (block * CONTROL_BLOCK + i) as f32 / SR;
+                let x = (2.0 * PI * 1000.0 * t).sin();
+                l[i] = x;
+                r[i] = -x;
+            }
+            engine.process_block(&mut l, Some(&mut r), &s);
+        }
+
+        assert!(
+            engine.meter(0).delta_db < -11.0,
+            "an anti-phase pair left the band asleep: {}",
+            engine.meter(0).delta_db
+        );
+    }
+
+    /// Turning dynamics off is a button press, not a cue for a step in the gain.
+    #[test]
+    fn switching_dynamics_off_walks_the_offset_out() {
+        let engaged = BandPlan {
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: -30.0,
+            attack: 1.0,
+            release: 60.0,
+            ..bell(1000.0, 0.0, 1.0)
+        };
+        let mut s = one_band(engaged);
+
+        let mut engine = EqEngine::new(SR);
+        delta_swing(&mut engine, &s, 1000.0, 200);
+        assert!(engine.meter(0).delta_db < -11.0, "the band never engaged");
+
+        // One block after the switch the offset must still be nearly all there.
+        s.bands[0].dynamic = false;
+        delta_swing(&mut engine, &s, 1000.0, 2);
+        let just_after = engine.meter(0).delta_db;
+        assert!(
+            just_after < -10.0,
+            "the offset dropped to {just_after} dB in a block"
+        );
+
+        // And several releases later it is gone, exactly rather than nearly —
+        // an envelope left trailing off is an envelope decaying into denormals.
+        delta_swing(&mut engine, &s, 1000.0, 2000);
+        assert_eq!(engine.meter(0).delta_db, 0.0, "the offset never let go");
+    }
+
+    /// A routing change drops filter state that describes the wrong signal. It
+    /// must not also drop the sidechain's, which taps the input either way.
+    #[test]
+    fn a_routing_change_keeps_the_dynamics_engaged() {
+        let mut s = one_band(BandPlan {
+            channel: BandChannel::Mid,
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: -30.0,
+            attack: 1.0,
+            release: 400.0,
+            ..bell(1000.0, 0.0, 1.0)
+        });
+
+        let mut engine = EqEngine::new(SR);
+        delta_swing(&mut engine, &s, 1000.0, 200);
+        assert!(engine.meter(0).delta_db < -11.0, "the band never engaged");
+
+        // Mid to left: a different domain, so the filter state goes.
+        s.bands[0].channel = BandChannel::Left;
+        delta_swing(&mut engine, &s, 1000.0, 2);
+        assert!(
+            engine.meter(0).delta_db < -11.0,
+            "the routing change reset the envelope: {}",
+            engine.meter(0).delta_db
+        );
+    }
+
+    /// A surgical band is the one that most wants dynamics, so its detector may
+    /// not be so narrow it hears nothing.
+    #[test]
+    fn a_very_narrow_band_still_engages() {
+        let mut engine = EqEngine::new(SR);
+        let s = one_band(BandPlan {
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: -30.0,
+            attack: 1.0,
+            release: 10.0,
+            ..bell(1000.0, 0.0, 30.0)
+        });
+
+        delta_swing(&mut engine, &s, 1000.0, 400);
+        assert!(
+            engine.meter(0).delta_db < -11.0,
+            "a Q of 30 left the detector deaf: {}",
+            engine.meter(0).delta_db
+        );
+    }
+
     #[test]
     fn dynamics_only_apply_to_gain_bearing_types() {
         // A notch has no gain, so `settings_for_block` refuses to make it dynamic;
@@ -1300,6 +1648,101 @@ mod tests {
             (out - (SINE_RMS_DB + 6.0)).abs() < 0.15,
             "got {out} dB at 96 kHz"
         );
+    }
+
+    fn suppressing() -> ResonanceSettings {
+        ResonanceSettings {
+            enabled: true,
+            depth: 1.0,
+            threshold_db: 3.0,
+            attack_ms: 2.0,
+            release_ms: 20.0,
+            ..ResonanceSettings::default()
+        }
+    }
+
+    #[test]
+    fn the_resonance_stage_runs_in_the_chain() {
+        let mut engine = EqEngine::new(SR);
+        let s = Settings {
+            resonance: suppressing(),
+            ..Settings::default()
+        };
+        let out = rms_db(&mut engine, &s, 1000.0, true);
+        assert!(
+            out < SINE_RMS_DB - 8.0,
+            "a lone tone came through the stage at {out} dB"
+        );
+        assert!(engine.resonance_peak() > 8.0);
+    }
+
+    /// Soloing is a way of hearing one band plainly. A suppressor working on
+    /// exactly the thing being listened for would defeat the point of it.
+    #[test]
+    fn soloing_stands_the_resonance_stage_down() {
+        let mut s = one_band(bell(1000.0, 0.0, 1.0));
+        s.resonance = suppressing();
+        s.solo = Some(0);
+
+        let mut engine = EqEngine::new(SR);
+        let out = rms_db(&mut engine, &s, 1000.0, true);
+        assert_eq!(engine.resonance_peak(), 0.0);
+        assert!(
+            out > SINE_RMS_DB - 3.0,
+            "the soloed band was suppressed anyway, at {out} dB"
+        );
+    }
+
+    /// A band's own resonance amount works with the global stage switched off,
+    /// and only where the band is.
+    #[test]
+    fn a_band_resonance_amount_works_on_its_own_region() {
+        let mut s = one_band(BandPlan {
+            resonance: 1.0,
+            ..bell(1000.0, 0.0, 2.0)
+        });
+        assert!(!s.resonance.enabled, "the global stage should be off here");
+
+        let mut engine = EqEngine::new(SR);
+        let out = rms_db(&mut engine, &s, 1000.0, true);
+        assert!(
+            out < SINE_RMS_DB - 8.0,
+            "the band's own amount did nothing: {out} dB"
+        );
+        assert!(engine.resonance_peak() > 8.0);
+
+        // Move the band two and a half octaves down and the tone is left alone.
+        s.bands[0].freq = 180.0;
+        let mut engine = EqEngine::new(SR);
+        let out = rms_db(&mut engine, &s, 1000.0, true);
+        assert!(
+            (out - SINE_RMS_DB).abs() < 1.0,
+            "a 180 Hz band reached a 1 kHz tone: {out} dB"
+        );
+
+        // And with the amount back at zero, nothing runs at all.
+        s.bands[0].freq = 1000.0;
+        s.bands[0].resonance = 0.0;
+        let mut engine = EqEngine::new(SR);
+        let out = rms_db(&mut engine, &s, 1000.0, true);
+        assert_eq!(engine.resonance_peak(), 0.0);
+        assert!((out - SINE_RMS_DB).abs() < 0.01, "got {out} dB");
+    }
+
+    #[test]
+    fn bypass_stands_the_resonance_stage_down_too() {
+        let mut s = Settings {
+            resonance: suppressing(),
+            ..Settings::default()
+        };
+        let mut engine = EqEngine::new(SR);
+        rms_db(&mut engine, &s, 1000.0, true);
+        assert!(engine.resonance_peak() > 8.0);
+
+        s.bypass = true;
+        let out = rms_db(&mut engine, &s, 1000.0, true);
+        assert_eq!(engine.resonance_peak(), 0.0);
+        assert!((out - SINE_RMS_DB).abs() < 0.02, "got {out} dB");
     }
 
     #[test]

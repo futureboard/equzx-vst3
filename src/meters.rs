@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use nih_plug::prelude::AtomicF32;
 
 use crate::dsp::engine::BandMeter;
+use crate::dsp::resonance::RES_BANDS;
 use crate::params::MAX_BANDS;
 
 pub struct Meters {
@@ -16,6 +17,10 @@ pub struct Meters {
     level: Vec<AtomicF32>,
     /// Gain offset the dynamics section is applying, in dB.
     delta: Vec<AtomicF32>,
+    /// dB of cut per resonance band. Positive is a cut.
+    resonance: Vec<AtomicF32>,
+    /// The deepest of those, so the UI can show activity without the curve.
+    resonance_peak: AtomicF32,
 }
 
 impl Default for Meters {
@@ -23,6 +28,8 @@ impl Default for Meters {
         Self {
             level: (0..MAX_BANDS).map(|_| AtomicF32::new(-100.0)).collect(),
             delta: (0..MAX_BANDS).map(|_| AtomicF32::new(0.0)).collect(),
+            resonance: (0..RES_BANDS).map(|_| AtomicF32::new(0.0)).collect(),
+            resonance_peak: AtomicF32::new(0.0),
         }
     }
 }
@@ -33,6 +40,13 @@ impl Meters {
         self.delta[slot].store(meter.delta_db, Ordering::Relaxed);
     }
 
+    pub fn publish_resonance(&self, curve: &[f32], peak: f32) {
+        for (slot, value) in curve.iter().enumerate().take(RES_BANDS) {
+            self.resonance[slot].store(*value, Ordering::Relaxed);
+        }
+        self.resonance_peak.store(peak, Ordering::Relaxed);
+    }
+
     pub fn read_into(&self, level: &mut [f32], delta: &mut [f32]) {
         for slot in 0..MAX_BANDS.min(level.len()).min(delta.len()) {
             level[slot] = self.level[slot].load(Ordering::Relaxed);
@@ -40,11 +54,23 @@ impl Meters {
         }
     }
 
+    /// Reads the reduction curve and returns its peak.
+    pub fn read_resonance(&self, out: &mut [f32]) -> f32 {
+        for slot in 0..RES_BANDS.min(out.len()) {
+            out[slot] = self.resonance[slot].load(Ordering::Relaxed);
+        }
+        self.resonance_peak.load(Ordering::Relaxed)
+    }
+
     pub fn clear(&self) {
         for slot in 0..MAX_BANDS {
             self.level[slot].store(-100.0, Ordering::Relaxed);
             self.delta[slot].store(0.0, Ordering::Relaxed);
         }
+        for slot in 0..RES_BANDS {
+            self.resonance[slot].store(0.0, Ordering::Relaxed);
+        }
+        self.resonance_peak.store(0.0, Ordering::Relaxed);
     }
 }
 

@@ -272,6 +272,11 @@ pub struct BandParams {
     pub attack: FloatParam,
     #[id = "rl"]
     pub release: FloatParam,
+
+    /// Adaptive resonance suppression inside this band's own region, on top of
+    /// whatever static curve the band is drawing. Zero is off.
+    #[id = "res"]
+    pub resonance: FloatParam,
 }
 
 impl Default for BandParams {
@@ -368,6 +373,146 @@ impl Default for BandParams {
             )
             .with_unit(" ms")
             .with_value_to_string(formatters::v2s_f32_rounded(0)),
+
+            // Off by default: a band the user drew is a band they want, not a
+            // starting point for something else to chew on.
+            resonance: FloatParam::new("Resonance", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(30.0))
+                .with_unit("%")
+                .with_value_to_string(formatters::v2s_f32_percentage(0))
+                .with_string_to_value(formatters::s2v_f32_percentage()),
+        }
+    }
+}
+
+/// Adaptive resonance suppression — see [`crate::dsp::resonance`] for what the
+/// stage does with these.
+///
+/// Ranges are the plain units the UI works in; the engine converts the
+/// percentages to the 0..1 ratios the bank wants.
+#[derive(Params)]
+pub struct ResonanceParams {
+    #[id = "rson"]
+    pub enabled: BoolParam,
+    #[id = "rsdep"]
+    pub depth: FloatParam,
+    #[id = "rssh"]
+    pub sharpness: FloatParam,
+    #[id = "rsthr"]
+    pub threshold: FloatParam,
+    #[id = "rsatk"]
+    pub attack: FloatParam,
+    #[id = "rsrel"]
+    pub release: FloatParam,
+    #[id = "rslo"]
+    pub low: FloatParam,
+    #[id = "rshi"]
+    pub high: FloatParam,
+    #[id = "rsmix"]
+    pub mix: FloatParam,
+    #[id = "rsdlt"]
+    pub delta: BoolParam,
+}
+
+impl Default for ResonanceParams {
+    fn default() -> Self {
+        Self {
+            // Off by default: a session that predates the stage has to sound
+            // exactly as it did, and a suppressor nobody asked for is the last
+            // thing anyone wants finding resonances in their mix.
+            enabled: BoolParam::new("Resonance", false),
+
+            depth: FloatParam::new("Resonance Depth", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(30.0))
+                .with_unit("%")
+                .with_value_to_string(formatters::v2s_f32_percentage(0))
+                .with_string_to_value(formatters::s2v_f32_percentage()),
+
+            sharpness: FloatParam::new(
+                "Resonance Sharpness",
+                0.5,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(30.0))
+            .with_unit("%")
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+
+            // Six dB clear of the local average. Lower starts shaving the
+            // partials of anything tonal, which is a choice rather than a default.
+            threshold: FloatParam::new(
+                "Resonance Threshold",
+                6.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 24.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(30.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            attack: FloatParam::new(
+                "Resonance Attack",
+                5.0,
+                FloatRange::Skewed {
+                    min: 0.5,
+                    max: 100.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            release: FloatParam::new(
+                "Resonance Release",
+                40.0,
+                FloatRange::Skewed {
+                    min: 5.0,
+                    max: 1000.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
+
+            low: FloatParam::new(
+                "Resonance Low",
+                20.0,
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 2000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_smoother(SmoothingStyle::Logarithmic(50.0))
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+
+            high: FloatParam::new(
+                "Resonance High",
+                20_000.0,
+                FloatRange::Skewed {
+                    min: 500.0,
+                    max: 20_000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_smoother(SmoothingStyle::Logarithmic(50.0))
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+
+            mix: FloatParam::new("Resonance Mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(30.0))
+                .with_unit("%")
+                .with_value_to_string(formatters::v2s_f32_percentage(0))
+                .with_string_to_value(formatters::s2v_f32_percentage()),
+
+            // Monitoring, not sound design — but it is a parameter so the host
+            // can bind it to a key and so it survives a reopened editor.
+            delta: BoolParam::new("Resonance Delta", false),
         }
     }
 }
@@ -381,6 +526,11 @@ pub struct EquzxParams {
 
     #[nested(array, group = "Band")]
     pub bands: [BandParams; MAX_BANDS],
+
+    /// Appended after the bands so every parameter that existed before it keeps
+    /// the automation index a host already wrote into its sessions.
+    #[nested(group = "Resonance")]
+    pub resonance: ResonanceParams,
 
     /// View state the DAW should remember but never automate: analyser mode,
     /// dB range, panel height, the parked A/B slot. Opaque JSON owned by the UI.
@@ -409,6 +559,7 @@ impl Default for EquzxParams {
             .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
             bands: std::array::from_fn(|_| BandParams::default()),
+            resonance: ResonanceParams::default(),
             ui_state: Arc::new(RwLock::new(String::new())),
         }
     }

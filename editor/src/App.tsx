@@ -9,6 +9,9 @@ import { BandStrip } from './components/BandStrip'
 import { Header } from './components/Header'
 import { Transport } from './components/Transport'
 import { PanelResizer } from './components/PanelResizer'
+import { WindowResizer } from './components/WindowResizer'
+import { ResonancePanel } from './components/ResonancePanel'
+import { defaultResonance, type Resonance } from './dsp/resonance'
 import {
   MAX_BANDS,
   defaultBands,
@@ -18,7 +21,13 @@ import {
   type Band,
   type ChannelView,
 } from './dsp/bands'
-import { cloneSnapshot, emptySnapshot, type Snapshot } from './state/presets'
+import {
+  cloneSnapshot,
+  emptySnapshot,
+  sanitizeResonance,
+  sanitizeSnapshot,
+  type Snapshot,
+} from './state/presets'
 
 /**
  * The same UI drives two very different things.
@@ -68,6 +77,13 @@ interface UiState {
   panelHeight: number
   slot: 'A' | 'B'
   parked: Snapshot
+  /**
+   * Window size. Read back by `persisted_size` in `src/editor.rs` when the
+   * editor next opens, which is why these two sit at the top level rather than
+   * nested with the rest — everything else here is the UI's own business.
+   */
+  width: number
+  height: number
 }
 
 export default function App() {
@@ -85,6 +101,7 @@ export default function App() {
   const [channelView, setChannelView] = useState<ChannelView>('all')
   const [outputGain, setOutputGain] = useState(0)
   const [maxBands, setMaxBands] = useState(MAX_BANDS)
+  const [resonance, setResonance] = useState<Resonance>(defaultResonance)
 
   const [fileName, setFileName] = useState('')
   const [loading, setLoading] = useState(false)
@@ -95,6 +112,10 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false)
   const [panelHeight, setPanelHeight] = useState(readPanelHeight)
   const [viewportH, setViewportH] = useState(() => window.innerHeight)
+  const [windowSize, setWindowSize] = useState(() => ({
+    width: window.innerWidth,
+    height: window.innerHeight,
+  }))
 
   // A/B: the live state is whichever slot is active; the other one is parked here.
   const [slot, setSlot] = useState<'A' | 'B'>('A')
@@ -161,7 +182,9 @@ export default function App() {
       if (ui.channelView) setChannelView(ui.channelView)
       if (typeof ui.panelHeight === 'number') setPanelHeight(ui.panelHeight)
       if (ui.slot === 'A' || ui.slot === 'B') setSlot(ui.slot)
-      if (ui.parked && Array.isArray(ui.parked.bands)) setParked(ui.parked)
+      // Sanitised rather than trusted: this came out of a session file, and one
+      // written before the resonance stage existed carries no settings for it.
+      if (ui.parked && Array.isArray(ui.parked.bands)) setParked(sanitizeSnapshot(ui.parked))
     } catch {
       // Nothing the session saved is worth breaking the editor over.
     }
@@ -174,6 +197,20 @@ export default function App() {
       setOutputGain(state.outputGain)
       setBypassed(state.bypass)
       setMaxBands(state.maxBands)
+      // The wire carries the bank's layout alongside its settings; only the
+      // settings belong in React state, the layout travels with the curve.
+      setResonance({
+        enabled: state.resonance.enabled,
+        depth: state.resonance.depth,
+        sharpness: state.resonance.sharpness,
+        threshold: state.resonance.threshold,
+        attack: state.resonance.attack,
+        release: state.resonance.release,
+        low: state.resonance.low,
+        high: state.resonance.high,
+        mix: state.resonance.mix,
+        delta: state.resonance.delta,
+      })
       // View state is restored once, on the first message. After that it belongs
       // to the user, and reapplying it would undo whatever they just changed.
       if (!uiRestored.current) {
@@ -197,9 +234,21 @@ export default function App() {
       panelHeight,
       slot,
       parked,
+      width: windowSize.width,
+      height: windowSize.height,
     }
     bridge.setUiState(JSON.stringify(ui))
-  }, [bridge, dbRange, analyzerMode, spectrumSmoothing, channelView, panelHeight, slot, parked])
+  }, [
+    bridge,
+    dbRange,
+    analyzerMode,
+    spectrumSmoothing,
+    channelView,
+    panelHeight,
+    slot,
+    parked,
+    windowSize,
+  ])
 
   // --- engine sync -------------------------------------------------------
   // Only the Web Audio engine needs pushing at; the plugin was told as it happened.
@@ -299,8 +348,21 @@ export default function App() {
     [bridge],
   )
 
+  const patchResonance = useCallback(
+    (patch: Partial<Resonance>) => {
+      setResonance((r) => ({ ...r, ...patch }))
+      bridge?.setResonance(patch)
+    },
+    [bridge],
+  )
+
   // --- A/B compare & presets ---------------------------------------------
-  const snapshot = useCallback((): Snapshot => ({ bands, outputGain }), [bands, outputGain])
+  // The sanitiser is what drops `delta` — it is a way of listening rather than
+  // part of the sound, so it survives a swap or a recall untouched.
+  const snapshot = useCallback(
+    (): Snapshot => ({ bands, outputGain, resonance: sanitizeResonance(resonance) }),
+    [bands, outputGain, resonance],
+  )
 
   /**
    * Replace everything at once — an A/B swap, a preset, a reset.
@@ -314,10 +376,13 @@ export default function App() {
       let next = snap.bands
       if (bridge) {
         next = snap.bands.slice(0, maxBands).map((band, i) => ({ ...band, id: i }))
-        bridge.loadState(next, snap.outputGain)
+        bridge.loadState(next, snap.outputGain, snap.resonance)
       }
       commitBands(next)
       setOutputGain(snap.outputGain)
+      // Merge rather than replace, so the delta monitor the snapshot doesn't
+      // carry is left where the user had it.
+      setResonance((r) => ({ ...r, ...snap.resonance }))
       // Ids differ between slots and presets, so nothing stays selected across a swap.
       setSelectedId(null)
       setSoloId(null)
@@ -347,11 +412,34 @@ export default function App() {
   const panelMax = Math.max(PANEL_MIN, viewportH - 380)
   const panelH = Math.min(panelHeight, panelMax)
 
+  /**
+   * The window's own size is read back rather than remembered, so a resize the
+   * host drove is persisted just as one from the grip is.
+   *
+   * The size that gets saved is debounced: a drag fires this every frame, and
+   * only the size the user stopped at is worth writing into the session.
+   */
   useEffect(() => {
-    const onResize = () => setViewportH(window.innerHeight)
+    let settle = 0
+    const onResize = () => {
+      setViewportH(window.innerHeight)
+      window.clearTimeout(settle)
+      settle = window.setTimeout(
+        () => setWindowSize({ width: window.innerWidth, height: window.innerHeight }),
+        250,
+      )
+    }
     window.addEventListener('resize', onResize)
-    return () => window.removeEventListener('resize', onResize)
+    return () => {
+      window.clearTimeout(settle)
+      window.removeEventListener('resize', onResize)
+    }
   }, [])
+
+  const resizeWindow = useCallback(
+    (width: number, height: number) => bridge?.resize(width, height),
+    [bridge],
+  )
 
   const changePanelHeight = useCallback((h: number) => {
     setPanelHeight(h)
@@ -479,6 +567,16 @@ export default function App() {
       <div ref={shellRef} className="relative flex h-full w-full flex-col bg-[#0b0b0d]">
         <div ref={headerRef} data-intro className="absolute inset-x-3 top-3 z-30">
           <Header
+            // The suppressor is a Rust stage, so it has no standalone-page half.
+            extras={
+              bridge ? (
+                <ResonancePanel
+                  resonance={resonance}
+                  engine={engine}
+                  onPatch={patchResonance}
+                />
+              ) : null
+            }
             channelView={channelView}
             dbRange={dbRange}
             outputGain={outputGain}
@@ -596,6 +694,9 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* A page can't resize its own browser window, so this is plugin-only. */}
+      {bridge && <WindowResizer onResize={resizeWindow} />}
 
       {webEngine && (
         <div

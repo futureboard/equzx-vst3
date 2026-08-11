@@ -5,8 +5,9 @@
 //! nothing to install.
 //!
 //! Per frame the loop does three things: drain whatever the UI sent, push a
-//! fresh [`StateMessage`] if the parameters moved *from anywhere else*, and — on
-//! a 30 Hz timer — push analyser curves and band meters.
+//! fresh [`StateMessage`] if the parameters moved *from anywhere else*, and push
+//! analyser curves and band meters. That last one is uncapped — a frame goes out
+//! every time the loop runs, which baseview drives from a 15 ms timer.
 //!
 //! The "from anywhere else" is the subtle part. Every UI action sets parameters
 //! immediately, so echoing the resulting state back would hand the UI its own
@@ -16,27 +17,24 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 use nih_plug::prelude::*;
 use nih_plug_webview::{HTMLSource, WebViewEditor};
 
 use crate::analyzer::{Analyzer, Taps};
 use crate::assets::AssetServer;
+use crate::dsp::resonance::RES_BANDS;
 use crate::meters::Meters;
-use crate::params::{BandParams, EquzxParams, TransientState, MAX_BANDS};
+use crate::params::{BandParams, EquzxParams, ResonanceParams, TransientState, MAX_BANDS};
 use crate::protocol::{
-    parse_channel, parse_dyn_mode, parse_kind, parse_slope, state_message, Action, BandPatch,
-    FrameMessage, StateMessage,
+    encode_reduction, parse_channel, parse_dyn_mode, parse_kind, parse_slope, state_message, Action,
+    BandPatch, FrameMessage, ResonancePatch, StateMessage,
 };
 
 /// Wide enough for the band editor's full control row — type, frequency,
 /// gain, Q, slope, all five channels, and the on/solo/delete group.
 pub const DEFAULT_WIDTH: u32 = 1260;
 pub const DEFAULT_HEIGHT: u32 = 760;
-/// Analyser frames per second. The curve is smoothed across frames anyway, so
-/// past this the extra traffic buys nothing the eye can use.
-const FRAME_HZ: u64 = 30;
 
 /// Everything the frame loop mutates. The loop closure is `Fn`, not `FnMut`, so
 /// this lives behind a lock — one only ever contended by the GUI thread itself.
@@ -44,9 +42,9 @@ struct EditorState {
     analyzer: Analyzer,
     /// Last state we told the UI about, as JSON.
     cache: Option<StateMessage>,
-    last_frame: Instant,
     level: Vec<f32>,
     delta: Vec<f32>,
+    resonance: Vec<f32>,
 }
 
 pub struct EditorContext {
@@ -94,9 +92,9 @@ pub fn create(ctx: EditorContext) -> WebViewEditor {
     let state = Mutex::new(EditorState {
         analyzer: Analyzer::new(ctx.sample_rate.load(Ordering::Relaxed)),
         cache: None,
-        last_frame: Instant::now(),
         level: vec![-100.0; MAX_BANDS],
         delta: vec![0.0; MAX_BANDS],
+        resonance: vec![0.0; RES_BANDS],
     });
 
     WebViewEditor::new(source, (width, height))
@@ -173,7 +171,11 @@ pub fn create(ctx: EditorContext) -> WebViewEditor {
                         set_float(&setter, &ctx.params.output_gain, value);
                         ui_originated = true;
                     }
-                    Action::LoadState { bands, output_gain } => {
+                    Action::LoadState {
+                        bands,
+                        output_gain,
+                        resonance,
+                    } => {
                         // Everything not named in the recall goes away, so an A/B
                         // swap can't leave a stray band from the other slot behind.
                         let mut wanted = [false; MAX_BANDS];
@@ -195,8 +197,15 @@ pub fn create(ctx: EditorContext) -> WebViewEditor {
                             }
                         }
                         set_float(&setter, &ctx.params.output_gain, output_gain);
+                        if let Some(patch) = &resonance {
+                            apply_resonance(&setter, &ctx.params.resonance, patch);
+                        }
                         ctx.transient.set_solo(None);
                         ctx.transient.flush.store(true, Ordering::Relaxed);
+                        ui_originated = true;
+                    }
+                    Action::Resonance { value } => {
+                        apply_resonance(&setter, &ctx.params.resonance, &value);
                         ui_originated = true;
                     }
                     Action::UiState { value } => {
@@ -234,20 +243,24 @@ pub fn create(ctx: EditorContext) -> WebViewEditor {
             }
 
             // --- analyser + meters ------------------------------------------
-            if st.last_frame.elapsed() >= Duration::from_millis(1000 / FRAME_HZ) {
-                st.last_frame = Instant::now();
-                let (pre, post) = st.analyzer.analyze(&ctx.taps);
-                ctx.meters.read_into(&mut st.level, &mut st.delta);
-                let frame = FrameMessage {
-                    msg: "frame",
-                    pre,
-                    post,
-                    level: st.level.iter().map(|v| round1(*v)).collect(),
-                    delta: st.delta.iter().map(|v| round1(*v)).collect(),
-                };
-                if let Ok(value) = serde_json::to_value(&frame) {
-                    wv.send_json(value);
-                }
+            // Uncapped: a frame goes out every time the editor's event loop runs.
+            // That loop is baseview's, driven by a 15 ms timer, so the real
+            // ceiling is around 66 Hz on Windows — there is no faster to go from
+            // here without owning the timer as well.
+            let (pre, post) = st.analyzer.analyze(&ctx.taps);
+            ctx.meters.read_into(&mut st.level, &mut st.delta);
+            let res_peak = ctx.meters.read_resonance(&mut st.resonance);
+            let frame = FrameMessage {
+                msg: "frame",
+                pre,
+                post,
+                level: st.level.iter().map(|v| round1(*v)).collect(),
+                delta: st.delta.iter().map(|v| round1(*v)).collect(),
+                res: encode_reduction(&st.resonance),
+                res_peak: round1(res_peak),
+            };
+            if let Ok(value) = serde_json::to_value(&frame) {
+                wv.send_json(value);
             }
         })
 }
@@ -321,7 +334,45 @@ fn reset_band(setter: &ParamSetter, p: &BandParams) {
     set_float(setter, &p.threshold, p.threshold.default_plain_value());
     set_float(setter, &p.attack, p.attack.default_plain_value());
     set_float(setter, &p.release, p.release.default_plain_value());
+    set_float(setter, &p.resonance, p.resonance.default_plain_value());
     set_bool(setter, &p.dynamic, p.dynamic.default_plain_value());
+}
+
+/// Apply a resonance patch.
+///
+/// Depth, sharpness and mix arrive as percentages — the units the UI shows —
+/// and are held as 0..1 ratios, which is the only conversion on this wire.
+fn apply_resonance(setter: &ParamSetter, p: &ResonanceParams, patch: &ResonancePatch) {
+    if let Some(v) = patch.enabled {
+        set_bool(setter, &p.enabled, v);
+    }
+    if let Some(v) = patch.depth {
+        set_float(setter, &p.depth, v / 100.0);
+    }
+    if let Some(v) = patch.sharpness {
+        set_float(setter, &p.sharpness, v / 100.0);
+    }
+    if let Some(v) = patch.mix {
+        set_float(setter, &p.mix, v / 100.0);
+    }
+    if let Some(v) = patch.threshold {
+        set_float(setter, &p.threshold, v);
+    }
+    if let Some(v) = patch.attack {
+        set_float(setter, &p.attack, v);
+    }
+    if let Some(v) = patch.release {
+        set_float(setter, &p.release, v);
+    }
+    if let Some(v) = patch.low {
+        set_float(setter, &p.low, v);
+    }
+    if let Some(v) = patch.high {
+        set_float(setter, &p.high, v);
+    }
+    if let Some(v) = patch.delta {
+        set_bool(setter, &p.delta, v);
+    }
 }
 
 /// Apply the fields a patch actually carries. Values outside a parameter's range
@@ -359,6 +410,10 @@ fn apply_patch(setter: &ParamSetter, p: &BandParams, patch: &BandPatch) {
     }
     if let Some(v) = patch.release {
         set_float(setter, &p.release, v);
+    }
+    // A percentage on the wire, a ratio in the parameter.
+    if let Some(v) = patch.resonance {
+        set_float(setter, &p.resonance, v / 100.0);
     }
     if let Some(v) = patch.enabled {
         set_bool(setter, &p.enabled, v);

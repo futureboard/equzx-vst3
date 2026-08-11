@@ -197,6 +197,16 @@ export function BandStrip({
               disabled={!USES_Q[band.type]}
               onChange={(v) => onPatch(band.id, { q: v })}
             />
+            <Knob
+              label="Res"
+              value={band.resonance}
+              min={0}
+              max={100}
+              defaultValue={0}
+              color={color}
+              format={(v) => (v > 0 ? `${v.toFixed(0)}%` : 'off')}
+              onChange={(v) => onPatch(band.id, { resonance: v })}
+            />
 
             <div className="flex flex-col gap-1">
               <div className="text-[9px] uppercase tracking-wider text-white/35">Slope</div>

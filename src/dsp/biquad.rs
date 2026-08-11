@@ -141,8 +141,10 @@ impl Coeffs {
         )
     }
 
-    /// |H(e^jw)| at `f`. Only used by tests and offline checks — the audio path
-    /// never needs the magnitude response.
+    /// |H(e^jw)| at `f`.
+    ///
+    /// Never called per sample: tests use it, and the resonance bank samples it
+    /// once at construction to learn how much its filters overlap.
     pub fn magnitude(&self, f: f32, sr: f32) -> f32 {
         let w = 2.0 * PI * f / sr;
         let (sw, cw) = w.sin_cos();

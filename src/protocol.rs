@@ -12,8 +12,11 @@
 //! Field names are camelCase throughout because the other end of this pipe is
 //! TypeScript, and `dsp/bands.ts` already named these things.
 
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
+use crate::dsp::resonance::{RES_BANDS, RES_MAX_CUT_DB};
 use crate::params::{BandChannel, BandKind, DynMode, EquzxParams, Slope, MAX_BANDS};
 
 /// A partial band edit. Every field is optional: dragging a handle sends the one
@@ -35,6 +38,25 @@ pub struct BandPatch {
     pub threshold: Option<f32>,
     pub attack: Option<f32>,
     pub release: Option<f32>,
+    pub resonance: Option<f32>,
+}
+
+/// A partial edit to the resonance stage. Percentages travel 0..100 and
+/// frequencies in Hz, like everything else on this wire — the editor converts to
+/// the ratios the parameters hold.
+#[derive(Deserialize, Default, Debug, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResonancePatch {
+    pub enabled: Option<bool>,
+    pub depth: Option<f32>,
+    pub sharpness: Option<f32>,
+    pub threshold: Option<f32>,
+    pub attack: Option<f32>,
+    pub release: Option<f32>,
+    pub low: Option<f32>,
+    pub high: Option<f32>,
+    pub mix: Option<f32>,
+    pub delta: Option<bool>,
 }
 
 /// One entry of a whole-state recall — an A/B swap, a preset, or an undo.
@@ -89,9 +111,22 @@ pub enum Action {
         value: f32,
     },
     /// Replace every band at once. Slots not listed are freed.
+    ///
+    /// The resonance stage rides along rather than arriving as its own message,
+    /// so a preset recall lands in one piece — the alternative is a frame where
+    /// the bands are the new preset's and the suppressor is still the old one's.
+    /// Absent on a recall from a UI that predates the stage, which then leaves
+    /// the stage alone.
     LoadState {
         bands: Vec<BandSlot>,
         output_gain: f32,
+        #[serde(default)]
+        resonance: Option<ResonancePatch>,
+    },
+    /// Edit the resonance stage. Only the fields present move.
+    Resonance {
+        #[serde(default)]
+        value: ResonancePatch,
     },
     /// Opaque view state the UI wants saved with the session.
     UiState {
@@ -120,6 +155,30 @@ pub struct BandState {
     pub threshold: f32,
     pub attack: f32,
     pub release: f32,
+    /// Per-band resonance suppression, 0..100 on the wire.
+    pub resonance: f32,
+}
+
+/// The resonance stage as the UI reads it.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResonanceState {
+    pub enabled: bool,
+    pub depth: f32,
+    pub sharpness: f32,
+    pub threshold: f32,
+    pub attack: f32,
+    pub release: f32,
+    pub low: f32,
+    pub high: f32,
+    pub mix: f32,
+    pub delta: bool,
+    /// Band count and span of the reduction curve, so the UI can place it
+    /// without hard-coding the bank's layout.
+    pub bands: usize,
+    pub f_lo: f32,
+    pub bands_per_octave: f32,
+    pub max_cut: f32,
 }
 
 #[derive(Serialize, Debug, Clone, PartialEq)]
@@ -133,6 +192,7 @@ pub struct StateMessage {
     pub bypass: bool,
     pub sample_rate: f32,
     pub max_bands: usize,
+    pub resonance: ResonanceState,
     /// Whatever the UI last asked to persist, verbatim.
     pub ui: String,
 }
@@ -152,6 +212,26 @@ pub struct FrameMessage {
     pub level: Vec<f32>,
     /// Per-slot dynamic gain offset in dB, indexed by slot.
     pub delta: Vec<f32>,
+    /// Base64 of one byte per resonance band — dB of cut, quantised against
+    /// [`RES_MAX_CUT_DB`]. Sixty bytes, so it costs the frame almost nothing.
+    pub res: String,
+    /// The deepest cut anywhere in the bank, in dB.
+    pub res_peak: f32,
+}
+
+/// Quantise the resonance reduction curve for the wire.
+///
+/// A byte per band is well under what the display can resolve across a curve
+/// this shallow, and it keeps a field that ships thirty times a second down to
+/// eighty characters of JSON.
+pub fn encode_reduction(curve: &[f32]) -> String {
+    let bytes: Vec<u8> = (0..RES_BANDS)
+        .map(|i| {
+            let db = curve.get(i).copied().unwrap_or(0.0);
+            ((db / RES_MAX_CUT_DB).clamp(0.0, 1.0) * 255.0).round() as u8
+        })
+        .collect();
+    STANDARD_NO_PAD.encode(bytes)
 }
 
 /// Read the parameters into the shape the UI expects.
@@ -176,9 +256,11 @@ pub fn state_message(params: &EquzxParams, ui: String, sample_rate: f32) -> Stat
             threshold: p.threshold.value(),
             attack: p.attack.value(),
             release: p.release.value(),
+            resonance: p.resonance.value() * 100.0,
         });
     }
 
+    let res = &params.resonance;
     StateMessage {
         msg: "state",
         bands,
@@ -186,6 +268,23 @@ pub fn state_message(params: &EquzxParams, ui: String, sample_rate: f32) -> Stat
         bypass: params.bypass.value(),
         sample_rate,
         max_bands: MAX_BANDS,
+        resonance: ResonanceState {
+            enabled: res.enabled.value(),
+            // The three ratios are held 0..1 and read 0..100 on the wire.
+            depth: res.depth.value() * 100.0,
+            sharpness: res.sharpness.value() * 100.0,
+            threshold: res.threshold.value(),
+            attack: res.attack.value(),
+            release: res.release.value(),
+            low: res.low.value(),
+            high: res.high.value(),
+            mix: res.mix.value() * 100.0,
+            delta: res.delta.value(),
+            bands: RES_BANDS,
+            f_lo: crate::dsp::resonance::RES_F_LO,
+            bands_per_octave: crate::dsp::resonance::RES_BANDS_PER_OCTAVE,
+            max_cut: RES_MAX_CUT_DB,
+        },
         ui,
     }
 }
@@ -273,20 +372,91 @@ mod tests {
     #[test]
     fn a_whole_state_recall_round_trips() {
         let action: Action = serde_json::from_str(
-            r#"{"type":"loadState","outputGain":-3,"bands":[
+            r#"{"type":"loadState","outputGain":-3,
+                "resonance":{"enabled":true,"depth":70},
+                "bands":[
                  {"slot":0,"type":"bell","freq":1000,"gain":4},
                  {"slot":5,"type":"highshelf","freq":8000,"gain":-2}]}"#,
         )
         .unwrap();
         match action {
-            Action::LoadState { bands, output_gain } => {
+            Action::LoadState {
+                bands,
+                output_gain,
+                resonance,
+            } => {
                 assert_eq!(output_gain, -3.0);
                 assert_eq!(bands.len(), 2);
                 assert_eq!(bands[1].slot, 5);
                 assert_eq!(bands[1].patch.kind.as_deref(), Some("highshelf"));
+                let res = resonance.expect("the recall carried no resonance");
+                assert_eq!(res.enabled, Some(true));
+                assert_eq!(res.depth, Some(70.0));
+                // Delta is a way of listening, so a recall never names it.
+                assert_eq!(res.delta, None);
             }
             other => panic!("parsed as {other:?}"),
         }
+    }
+
+    /// A recall from before the resonance stage existed still parses, and says
+    /// nothing about the stage rather than resetting it.
+    #[test]
+    fn a_recall_without_resonance_leaves_the_stage_alone() {
+        let action: Action = serde_json::from_str(
+            r#"{"type":"loadState","outputGain":0,"bands":[{"slot":0,"type":"bell"}]}"#,
+        )
+        .unwrap();
+        match action {
+            Action::LoadState { resonance, .. } => assert!(resonance.is_none()),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_resonance_edit_carries_only_what_moved() {
+        let action: Action = serde_json::from_str(
+            r#"{"type":"resonance","value":{"enabled":true,"depth":80,"low":120}}"#,
+        )
+        .unwrap();
+        match action {
+            Action::Resonance { value } => {
+                assert_eq!(value.enabled, Some(true));
+                assert_eq!(value.depth, Some(80.0));
+                assert_eq!(value.low, Some(120.0));
+                assert_eq!(value.sharpness, None);
+                assert_eq!(value.delta, None);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_reduction_curve_quantises_across_its_range() {
+        let mut curve = vec![0.0f32; RES_BANDS];
+        curve[0] = RES_MAX_CUT_DB;
+        curve[1] = RES_MAX_CUT_DB / 2.0;
+        // Deeper than the scale, and negative, both have to land on an end.
+        curve[2] = RES_MAX_CUT_DB * 3.0;
+        curve[3] = -5.0;
+
+        let bytes = STANDARD_NO_PAD.decode(encode_reduction(&curve)).unwrap();
+        assert_eq!(bytes.len(), RES_BANDS);
+        assert_eq!(bytes[0], 255);
+        assert!((i32::from(bytes[1]) - 128).abs() <= 1, "got {}", bytes[1]);
+        assert_eq!(bytes[2], 255);
+        assert_eq!(bytes[3], 0);
+        assert_eq!(bytes[4], 0);
+    }
+
+    /// A short curve is a bug somewhere upstream, not a reason to panic in the
+    /// editor's frame loop.
+    #[test]
+    fn a_short_reduction_curve_still_encodes() {
+        assert_eq!(
+            STANDARD_NO_PAD.decode(encode_reduction(&[])).unwrap().len(),
+            RES_BANDS
+        );
     }
 
     #[test]
@@ -326,5 +496,19 @@ mod tests {
         assert!(json.contains(r#""type":"state""#));
         assert!(json.contains(r#""outputGain":0"#));
         assert!(json.contains(r#""maxBands":24"#));
+    }
+
+    #[test]
+    fn the_resonance_state_reads_back_in_the_units_the_ui_shows() {
+        let params = EquzxParams::default();
+        let res = state_message(&params, String::new(), 48_000.0).resonance;
+        // Off out of the box, and the ratios are percentages on the wire.
+        assert!(!res.enabled);
+        assert_eq!(res.depth, 50.0);
+        assert_eq!(res.sharpness, 50.0);
+        assert_eq!(res.mix, 100.0);
+        // The bank's layout travels with it so the UI need not hard-code it.
+        assert_eq!(res.bands, RES_BANDS);
+        assert_eq!(res.max_cut, RES_MAX_CUT_DB);
     }
 }

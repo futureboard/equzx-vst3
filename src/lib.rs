@@ -22,6 +22,7 @@ pub mod version;
 
 use crate::analyzer::Taps;
 use crate::dsp::engine::{settings_for_block, EqEngine, CONTROL_BLOCK};
+use crate::dsp::resonance::RES_BANDS;
 use crate::meters::Meters;
 use crate::params::{EquzxParams, TransientState, MAX_BANDS};
 
@@ -33,6 +34,9 @@ pub struct Equzx {
     /// Published for the editor, which needs the rate to map bins to frequencies.
     sample_rate: Arc<AtomicF32>,
     engine: EqEngine,
+    /// Somewhere to read the resonance curve into on the way to the meters,
+    /// owned here so `process` never allocates.
+    resonance_curve: [f32; RES_BANDS],
 }
 
 impl Default for Equzx {
@@ -44,6 +48,7 @@ impl Default for Equzx {
             meters: Arc::new(Meters::default()),
             sample_rate: Arc::new(AtomicF32::new(48_000.0)),
             engine: EqEngine::new(48_000.0),
+            resonance_curve: [0.0; RES_BANDS],
         }
     }
 }
@@ -182,6 +187,9 @@ impl Plugin for Equzx {
         for slot in 0..MAX_BANDS {
             self.meters.publish(slot, self.engine.meter(slot));
         }
+        self.engine.resonance_reduction(&mut self.resonance_curve);
+        self.meters
+            .publish_resonance(&self.resonance_curve, self.engine.resonance_peak());
 
         ProcessStatus::Normal
     }

@@ -28,6 +28,22 @@ export interface SpectrumCurve {
   ceilDb: number
 }
 
+/**
+ * What the resonance suppressor is doing right now, band by band.
+ *
+ * The bank's layout travels with the curve rather than being hard-coded here,
+ * so changing the band count or span in the Rust stage doesn't silently
+ * misplace the drawing.
+ */
+export interface ResonanceCurve {
+  /** dB of cut per band, index 0 at `fLo`. Positive is a cut. */
+  db: Float32Array
+  fLo: number
+  bandsPerOctave: number
+  /** Deepest cut anywhere in the bank, in dB. */
+  peak: number
+}
+
 export interface EqEngine {
   readonly sampleRate: number
   /** Is there anything to listen to? A plugin always says yes. */
@@ -38,6 +54,12 @@ export interface EqEngine {
   getDelta(id: number): number
   /** Measured band level in dBFS, for the threshold meter. */
   getLevel(id: number): number
+  /**
+   * Live resonance suppression, or null when nothing is being cut. Optional
+   * because the stage lives in the Rust DSP: the Web Audio engine behind the
+   * standalone page has no equivalent and simply doesn't implement it.
+   */
+  getResonance?(): ResonanceCurve | null
 }
 
 /** Points in a curve produced on the JS side. Matches the plugin's `LOG_POINTS`. */

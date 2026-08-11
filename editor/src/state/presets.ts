@@ -8,11 +8,22 @@ import {
   type BandChannel,
   type BandType,
 } from '../dsp/bands'
+import { defaultResonance, type Resonance } from '../dsp/resonance'
+
+/**
+ * The resonance settings a snapshot carries — everything except `delta`.
+ *
+ * Delta is a way of listening, not part of the sound being designed, so it is
+ * left out for the same reason solo is: recalling a preset that silently put
+ * you in residue-monitoring mode would be a trap, not a feature.
+ */
+export type ResonancePreset = Omit<Resonance, 'delta'>
 
 /** Everything an A/B slot or a preset carries. */
 export interface Snapshot {
   bands: Band[]
   outputGain: number
+  resonance: ResonancePreset
 }
 
 export interface Preset extends Snapshot {
@@ -20,7 +31,15 @@ export interface Preset extends Snapshot {
   version: number
 }
 
-export const PRESET_VERSION = 1
+/**
+ * Bumped when the resonance stage joined the snapshot. Nothing reads it to
+ * migrate — the format only ever gains fields, and [`sanitizeSnapshot`] fills
+ * in whatever an older file left out — but a file should still say what shape
+ * it was written in.
+ */
+export const PRESET_VERSION = 2
+// Unchanged: version 1 entries load fine through the sanitiser, and moving the
+// key would orphan every preset anyone has already saved.
 const STORAGE_KEY = 'equzfree.presets.v1'
 
 const VALID_TYPES = new Set<string>(BAND_TYPES.map((t) => t.value))
@@ -66,7 +85,31 @@ export function sanitizeBand(raw: unknown): Band {
     threshold: num(o.threshold, -24, -70, 0),
     attack: num(o.attack, 20, 1, 300),
     release: num(o.release, 200, 10, 2000),
+    resonance: num(o.resonance, 0, 0, 100),
   })
+}
+
+/**
+ * Rebuild the resonance settings from untrusted input.
+ *
+ * Ranges mirror `ResonanceParams` in `src/params.rs`. A preset written before
+ * the stage existed carries no `resonance` at all, and lands on the defaults —
+ * which have it switched off, so an old preset still sounds like an old preset.
+ */
+export function sanitizeResonance(raw: unknown): ResonancePreset {
+  const o = (raw ?? {}) as Record<string, unknown>
+  const d = defaultResonance()
+  return {
+    enabled: bool(o.enabled, d.enabled),
+    depth: num(o.depth, d.depth, 0, 100),
+    sharpness: num(o.sharpness, d.sharpness, 0, 100),
+    threshold: num(o.threshold, d.threshold, -12, 24),
+    attack: num(o.attack, d.attack, 0.5, 100),
+    release: num(o.release, d.release, 5, 1000),
+    low: num(o.low, d.low, 20, 2000),
+    high: num(o.high, d.high, 500, 20000),
+    mix: num(o.mix, d.mix, 0, 100),
+  }
 }
 
 export function sanitizeSnapshot(raw: unknown): Snapshot {
@@ -75,6 +118,7 @@ export function sanitizeSnapshot(raw: unknown): Snapshot {
   return {
     bands: list.slice(0, MAX_BANDS).map(sanitizeBand),
     outputGain: num(o.outputGain, 0, -24, 12),
+    resonance: sanitizeResonance(o.resonance),
   }
 }
 
@@ -83,11 +127,12 @@ export function cloneSnapshot(snap: Snapshot): Snapshot {
   return {
     bands: snap.bands.map((b) => makeBand({ ...b })),
     outputGain: snap.outputGain,
+    resonance: { ...snap.resonance },
   }
 }
 
 export function emptySnapshot(): Snapshot {
-  return { bands: [], outputGain: 0 }
+  return { bands: [], outputGain: 0, resonance: sanitizeResonance({}) }
 }
 
 // --- persistence ---------------------------------------------------------

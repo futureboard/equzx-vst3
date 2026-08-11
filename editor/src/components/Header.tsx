@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { CONTROL, Dropdown, Menu, MenuDivider, MenuItem } from "./ui/Menu";
 import { PresetMenu } from "./PresetMenu";
 import { Knob } from "./Knob";
@@ -6,6 +7,12 @@ import type { Snapshot } from "../state/presets";
 import Logo from "../assets/logo.svg";
 
 interface Props {
+  /**
+   * Controls that only exist in some builds, dropped in beside the output
+   * section. The resonance stage lives in the Rust DSP, so the standalone page
+   * has nothing to put here.
+   */
+  extras?: ReactNode;
   channelView: ChannelView;
   dbRange: number;
   outputGain: number;
@@ -50,6 +57,7 @@ function trackSheen(ev: React.PointerEvent<HTMLElement>) {
 }
 
 export function Header({
+  extras,
   channelView,
   dbRange,
   outputGain,
@@ -158,6 +166,8 @@ export function Header({
             onChange={onOutputGain}
           />
         </div>
+
+        {extras}
 
         <button
           type="button"

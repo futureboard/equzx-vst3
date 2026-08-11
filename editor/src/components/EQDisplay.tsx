@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as d3 from 'd3'
 import { animate } from 'animejs'
-import type { EqEngine, SpectrumCurve } from '../audio/engine'
+import type { EqEngine, ResonanceCurve, SpectrumCurve } from '../audio/engine'
 import { makeGrid, type ResponseGrid } from '../dsp/biquad'
 import { MOCHI, MOCHI_RGB, NEON_RGB, SURFACE_DEEP } from '../theme'
 import { boxBlur, ensureScratch, makeScratch, sampleBins, type SpectrumScratch } from '../dsp/spectrum'
@@ -268,6 +268,10 @@ export function EQDisplay({
       }
 
       if (cache.current) drawCurves(ctx, cache.current, gridFreqs, L, engine, sr)
+      // Last, and on the same dB axis as the EQ curve: what the suppressor is
+      // taking out reads as a cut of that many dB, which is what it is.
+      const res = engine?.getResonance?.()
+      if (res && !L.bypassed) drawResonance(ctx, res, L)
       ctx.restore()
     }
     raf = requestAnimationFrame(draw)
@@ -805,6 +809,70 @@ function pathFrom(
     if (i === 0) ctx.moveTo(px, py)
     else ctx.lineTo(px, py)
   }
+}
+
+/**
+ * The resonance stage's live reduction, hanging off the zero line.
+ *
+ * Drawn in the plot's own dB scale rather than on a meter of its own, so six dB
+ * of suppression is six dB down — directly comparable with the band curves it
+ * sits under, and readable as "this is the shape being subtracted".
+ */
+function drawResonance(ctx: CanvasRenderingContext2D, res: ResonanceCurve, L: LiveState) {
+  const { x, y, inner } = L
+  const n = res.db.length
+  if (!n) return
+
+  ctx.save()
+  ctx.beginPath()
+  ctx.rect(0, 0, inner.w, inner.h)
+  ctx.clip()
+
+  const zero = y(0)
+  ctx.beginPath()
+  let started = false
+  for (let i = 0; i < n; i++) {
+    const freq = res.fLo * Math.pow(2, i / res.bandsPerOctave)
+    if (freq < F_MIN || freq > F_MAX) continue
+    const px = x(freq)
+    const py = y(-res.db[i])
+    if (!started) {
+      ctx.moveTo(px, zero)
+      started = true
+    }
+    ctx.lineTo(px, py)
+  }
+  if (!started) {
+    ctx.restore()
+    return
+  }
+
+  // Close the path back along the zero line so the gap between them fills.
+  const lastFreq = res.fLo * Math.pow(2, (n - 1) / res.bandsPerOctave)
+  ctx.lineTo(x(Math.min(lastFreq, F_MAX)), zero)
+  ctx.closePath()
+  ctx.fillStyle = `rgba(${NEON_RGB},0.22)`
+  ctx.fill()
+
+  // And the same outline again, stroked, so a shallow cut is still visible.
+  ctx.beginPath()
+  started = false
+  for (let i = 0; i < n; i++) {
+    const freq = res.fLo * Math.pow(2, i / res.bandsPerOctave)
+    if (freq < F_MIN || freq > F_MAX) continue
+    const px = x(freq)
+    const py = y(-res.db[i])
+    if (started) ctx.lineTo(px, py)
+    else {
+      ctx.moveTo(px, py)
+      started = true
+    }
+  }
+  ctx.strokeStyle = `rgba(${NEON_RGB},0.85)`
+  ctx.lineWidth = 1.4
+  ctx.lineJoin = 'round'
+  ctx.stroke()
+  ctx.restore()
 }
 
 function drawCurves(

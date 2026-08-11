@@ -1,4 +1,6 @@
-use baseview::{Event, Size, Window, WindowHandle, WindowOpenOptions, WindowScalePolicy};
+use baseview::{
+    Event, Size, Window, WindowEvent, WindowHandle, WindowInfo, WindowOpenOptions, WindowScalePolicy,
+};
 use nih_plug::prelude::{Editor, GuiContext, ParamSetter};
 use serde_json::Value;
 use std::{
@@ -121,15 +123,35 @@ pub struct WindowHandler {
 }
 
 impl WindowHandler {
+    /// Ask for a new editor size, in logical pixels.
+    ///
+    /// Everything here is asynchronous, and that is the whole point. This is
+    /// called from the event-loop callback, which runs inside baseview's window
+    /// procedure with its handler `RefCell` mutably borrowed — so anything that
+    /// synchronously provokes a window message lands back in that same window
+    /// procedure, hits the same `RefCell`, and panics. The panic happens inside
+    /// an `extern "system"` function that cannot unwind, so the process aborts
+    /// rather than merely losing the editor: a hard crash, taking the host with
+    /// it.
+    ///
+    /// That is why `baseview::Window::resize` queues a deferred task instead of
+    /// calling `SetWindowPos` directly, and why the webview's own bounds are
+    /// *not* set here — see [`Self::stretch_webview`], which does it once the
+    /// window has actually arrived at its new size.
     pub fn resize(&self, window: &mut baseview::Window, width: u32, height: u32) {
-        self.webview.set_bounds(wry::Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        });
+        // A drag sends one of these a frame; without this, every one of them
+        // would be a round trip to the host asking for the size it already has.
+        if self.width.load(Ordering::Relaxed) == width
+            && self.height.load(Ordering::Relaxed) == height
+        {
+            return;
+        }
         self.width.store(width, Ordering::Relaxed);
         self.height.store(height, Ordering::Relaxed);
+
+        // Both of these are deferred: every wrapper posts `request_resize` to a
+        // queue, and baseview runs the resize at the end of the current window
+        // procedure call.
         self.context.request_resize();
         window.resize(Size {
             width: width as f64,
@@ -137,13 +159,39 @@ impl WindowHandler {
         });
     }
 
+    /// Stretch the webview over the window, at the size the window now is.
+    ///
+    /// Safe to call from a window-message handler precisely because it does not
+    /// change the window: the `WM_SIZE` this may bounce back carries a size
+    /// baseview has already recorded, and baseview drops such an event before it
+    /// touches the handler it is currently inside.
+    ///
+    /// Physical pixels, because that is what wry's bounds are in — the previous
+    /// code passed logical size to both this and the window, which came apart on
+    /// any display not at 100%.
+    fn stretch_webview(&self, info: &WindowInfo) {
+        let size = info.physical_size();
+        self.webview.set_bounds(wry::Rect {
+            x: 0,
+            y: 0,
+            width: size.width,
+            height: size.height,
+        });
+    }
+
     pub fn send_json(&self, json: Value) {
         let json_str = json.to_string();
         let json_str_quoted =
             serde_json::to_string(&json_str).expect("Should not fail: the value is always string");
-        self.webview
+        // A failed script evaluation is a message the UI didn't get — a dropped
+        // frame of meter movement, at worst. It used to be an unwrap, which made
+        // it the end of the host process instead.
+        if let Err(e) = self
+            .webview
             .evaluate_script(&format!("onPluginMessageInternal({});", json_str_quoted))
-            .unwrap();
+        {
+            nih_plug::nih_debug_assert_failure!("nih_plug_webview: evaluate_script failed: {}", e);
+        }
     }
 
     pub fn next_event(&self) -> Result<Value, crossbeam::channel::TryRecvError> {
@@ -240,6 +288,13 @@ impl baseview::WindowHandler for WindowHandler {
                 }
             }
             Event::Mouse(mouse_event) => (self.mouse_handler)(mouse_event),
+            // The window has settled at a new size — ours to follow, whether the
+            // request came from the plugin or from the host dragging its own
+            // frame. The latter never used to reach the webview at all.
+            Event::Window(WindowEvent::Resized(info)) => {
+                self.stretch_webview(&info);
+                EventStatus::Ignored
+            }
             _ => EventStatus::Ignored,
         }
     }
@@ -264,7 +319,24 @@ impl Editor for WebViewEditor {
         context: Arc<dyn GuiContext>,
     ) -> Box<dyn std::any::Any + Send> {
         let options = WindowOpenOptions {
+            // Added to the vendored copy.
+            //
+            // The webview is not DPI-aware on these platforms — WebView2 reports
+            // a `devicePixelRatio` of 1 and renders CSS pixels as physical ones,
+            // which is why `set_scale_factor` below refuses the host's scale
+            // factor outright. Letting baseview apply the *system* scale anyway
+            // made the two disagree by exactly that factor: at 150% the window
+            // opened half again as large as the webview inside it, so a third of
+            // it was bare background, and every size the UI asked for came back
+            // 1.5x too big — a resize grip that overshot, and a persisted size
+            // that grew by half on every reopen.
+            //
+            // macOS is left alone: WKWebView does handle scaling, so there the
+            // system factor is the right one.
+            #[cfg(target_os = "macos")]
             scale: WindowScalePolicy::SystemScaleFactor,
+            #[cfg(not(target_os = "macos"))]
+            scale: WindowScalePolicy::ScaleFactor(1.0),
             size: Size {
                 width: self.width.load(Ordering::Relaxed) as f64,
                 height: self.height.load(Ordering::Relaxed) as f64,

@@ -92,6 +92,13 @@ export interface Band {
   threshold: number
   attack: number
   release: number
+
+  /**
+   * Adaptive resonance suppression inside this band's own region, 0-100%, on
+   * top of whatever static curve the band draws. Independent of the global
+   * resonance stage, which it borrows its shaping controls from.
+   */
+  resonance: number
 }
 
 /** dB past the threshold at which the band reaches its full range — a soft knee. */
@@ -235,6 +242,7 @@ export function makeBand(partial: Partial<Band> = {}): Band {
     threshold: -24,
     attack: 20,
     release: 200,
+    resonance: 0,
     ...partial,
     id: nextId++,
   }
