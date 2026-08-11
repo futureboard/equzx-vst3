@@ -237,9 +237,9 @@ export default function App() {
   // itself and never from inside a state updater — React is free to run an
   // updater twice, and the plugin would hear the edit twice with it.
   const addBand = useCallback(
-    (freq = 1000, gain = 0) => {
+    (freq = 1000, gain = 0): number | null => {
       const current = bandsRef.current
-      if (current.length >= maxBands) return
+      if (current.length >= maxBands) return null
       const shape = {
         freq,
         gain,
@@ -251,7 +251,7 @@ export default function App() {
         // In the plugin the id is a parameter slot, so it has to be a free one
         // rather than the next number from a counter.
         const slot = freeSlot(current, maxBands)
-        if (slot === null) return
+        if (slot === null) return null
         band = makeBandInSlot(slot, shape)
         bridge.addBand(slot, band)
       } else {
@@ -259,6 +259,7 @@ export default function App() {
       }
       commitBands([...current, band].sort((a, b) => a.freq - b.freq))
       setSelectedId(band.id)
+      return band.id
     },
     [channelView, bridge, maxBands, commitBands],
   )
@@ -523,7 +524,7 @@ export default function App() {
               onPatch={patch}
               onSelect={setSelectedId}
               onSolo={changeSolo}
-              onAdd={(f, g) => addBand(f, g)}
+              onAdd={addBand}
               onRemove={removeBand}
             />
             {/* Sits inside the plot, top-right, over the analyser it controls. */}

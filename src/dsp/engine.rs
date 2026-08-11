@@ -1,15 +1,23 @@
 //! The EQ itself.
 //!
-//! # Why everything runs in mid/side
+//! # Two domains, one chain
 //!
-//! The Web Audio prototype rewired its graph whenever a band switched between
-//! stereo and mid/side. Here the signal is *always* encoded to mid/side, every
-//! band runs on the buses it belongs to, and the result is decoded back. That
-//! costs nothing: a stereo band running on both M and S is the same amount of
-//! filtering as running on L and R, and because the M/S transform is linear and
-//! the two filters are identical, the result is the L/R answer to within
-//! rounding. What it buys is a topology that never changes — no rebuild, no
-//! reconnection, and no click when a band's channel changes.
+//! A band can act on the stereo signal, on left or right alone, or on mid or
+//! side alone. The last two pairs are different *views* of the same signal, and
+//! a left-only filter is not expressible as a pair of independent mid and side
+//! filters — so no single domain can serve every band.
+//!
+//! What makes that cheap is that the two views are related by an exactly
+//! invertible transform costing four operations a sample. So the chain carries
+//! the signal in whichever domain the band it is about to run needs, converting
+//! in place when it crosses from one to the other, and converts back to
+//! left/right at the end. A stereo band needs neither domain in particular: the
+//! same filter on both buses gives the same answer either way, because the
+//! transform is linear.
+//!
+//! In practice the conversions are rare — bands of a kind tend to sit together,
+//! and a session that only uses stereo and mid/side bands does exactly one
+//! encode and one decode, the same as before left/right existed.
 //!
 //! # Control rate
 //!
@@ -25,7 +33,9 @@
 
 use crate::dsp::biquad::{butterworth_qs, Biquad, Coeffs, MAX_SECTIONS};
 use crate::dsp::dynamics::{dynamic_step, ms_to_db, DynSettings};
-use crate::params::{BandChannel, BandKind, DynMode, EquzxParams, TransientState, MAX_BANDS};
+use crate::params::{
+    BandChannel, BandKind, Domain, DynMode, EquzxParams, TransientState, MAX_BANDS,
+};
 
 /// Samples between coefficient updates. A power of two, and small enough that a
 /// 1 ms dynamics attack still resolves to a handful of steps.
@@ -165,11 +175,16 @@ impl CoeffKey {
 
 /// Per-band filter state, split by bus. Both buses share one coefficient set —
 /// a band is one filter, applied wherever it is routed.
+///
+/// Which signal a bus carries depends on the domain the band runs in, which is
+/// why they are named by position rather than by channel.
 struct BandRuntime {
     coeffs: [Coeffs; MAX_SECTIONS],
     sections: usize,
-    mid: [Biquad; MAX_SECTIONS],
-    side: [Biquad; MAX_SECTIONS],
+    /// Filter state for the first bus of the band's domain — left, or mid.
+    bus_a: [Biquad; MAX_SECTIONS],
+    /// And for the second — right, or side.
+    bus_b: [Biquad; MAX_SECTIONS],
     key: CoeffKey,
 
     /// Sidechain filter isolating the region this band acts on.
@@ -183,8 +198,11 @@ struct BandRuntime {
     /// Level measured on the band-filtered input, in dBFS. Drives the UI meter.
     level_db: f32,
 
-    ran_mid: bool,
-    ran_side: bool,
+    ran_a: bool,
+    ran_b: bool,
+    /// Domain the band last ran in. Filter state carried across a domain change
+    /// describes a different signal, so it is dropped rather than reused.
+    ran_domain: Option<Domain>,
 }
 
 impl Default for BandRuntime {
@@ -192,8 +210,8 @@ impl Default for BandRuntime {
         Self {
             coeffs: [Coeffs::identity(); MAX_SECTIONS],
             sections: 0,
-            mid: [Biquad::new(); MAX_SECTIONS],
-            side: [Biquad::new(); MAX_SECTIONS],
+            bus_a: [Biquad::new(); MAX_SECTIONS],
+            bus_b: [Biquad::new(); MAX_SECTIONS],
             key: CoeffKey::NONE,
             det_coeffs: Coeffs::identity(),
             det: Biquad::new(),
@@ -201,15 +219,16 @@ impl Default for BandRuntime {
             env: 0.0,
             delta_db: 0.0,
             level_db: -100.0,
-            ran_mid: false,
-            ran_side: false,
+            ran_a: false,
+            ran_b: false,
+            ran_domain: None,
         }
     }
 }
 
 impl BandRuntime {
     fn reset(&mut self) {
-        for s in self.mid.iter_mut().chain(self.side.iter_mut()) {
+        for s in self.bus_a.iter_mut().chain(self.bus_b.iter_mut()) {
             s.reset();
         }
         self.det.reset();
@@ -300,8 +319,8 @@ impl BandRuntime {
     #[inline]
     fn run(&mut self, buf: &mut [f32], bus: Bus) {
         let states = match bus {
-            Bus::Mid => &mut self.mid,
-            Bus::Side => &mut self.side,
+            Bus::A => &mut self.bus_a,
+            Bus::B => &mut self.bus_b,
         };
         for section in 0..self.sections {
             let c = self.coeffs[section];
@@ -313,10 +332,12 @@ impl BandRuntime {
     }
 }
 
+/// Which of a band's two filter-state sets to run through. What the bus carries
+/// — left or mid, right or side — depends on the current [`Domain`].
 #[derive(Clone, Copy)]
 enum Bus {
-    Mid,
-    Side,
+    A,
+    B,
 }
 
 /// Snapshot of the per-band meters the editor polls each frame.
@@ -335,9 +356,36 @@ pub struct EqEngine {
     solo_l: Biquad,
     solo_r: Biquad,
 
-    mid_buf: [f32; CONTROL_BLOCK],
-    side_buf: [f32; CONTROL_BLOCK],
+    /// The block's input, kept so the sidechains measure the signal as it
+    /// arrived rather than as earlier bands left it.
+    pre_l: [f32; CONTROL_BLOCK],
+    pre_r: [f32; CONTROL_BLOCK],
     det_buf: [f32; CONTROL_BLOCK],
+}
+
+/// Move a stereo pair between the two domains, in place.
+///
+/// Exactly invertible: encoding gives `(l+r)/2` and `(l-r)/2`, decoding sums and
+/// differences them straight back. Four operations a sample, which is what makes
+/// switching domains mid-chain cheap enough to do per band.
+#[inline]
+fn convert(a: &mut [f32], b: &mut [f32], n: usize, to: Domain) {
+    match to {
+        Domain::MidSide => {
+            for i in 0..n {
+                let (l, r) = (a[i], b[i]);
+                a[i] = 0.5 * (l + r);
+                b[i] = 0.5 * (l - r);
+            }
+        }
+        Domain::LeftRight => {
+            for i in 0..n {
+                let (m, side) = (a[i], b[i]);
+                a[i] = m + side;
+                b[i] = m - side;
+            }
+        }
+    }
 }
 
 impl Default for EqEngine {
@@ -355,8 +403,8 @@ impl EqEngine {
             solo_key: CoeffKey::NONE,
             solo_l: Biquad::new(),
             solo_r: Biquad::new(),
-            mid_buf: [0.0; CONTROL_BLOCK],
-            side_buf: [0.0; CONTROL_BLOCK],
+            pre_l: [0.0; CONTROL_BLOCK],
+            pre_r: [0.0; CONTROL_BLOCK],
             det_buf: [0.0; CONTROL_BLOCK],
         }
     }
@@ -395,8 +443,12 @@ impl EqEngine {
         }
     }
 
-    /// Process one control block in place. Pass `None` for `right` on mono input,
-    /// in which case the side bus is skipped entirely.
+    /// Process one control block in place.
+    ///
+    /// Pass `None` for `right` on mono input. There is no second bus then, so
+    /// right- and side-only bands have nothing to act on and are skipped, while
+    /// a mid-only band sees the whole signal — which is what mid means when
+    /// there is only one channel.
     pub fn process_block(&mut self, left: &mut [f32], right: Option<&mut [f32]>, s: &Settings) {
         let n = left.len().min(CONTROL_BLOCK);
         if n == 0 {
@@ -408,34 +460,27 @@ impl EqEngine {
         // own bypass button to this parameter and expect the plugin to vanish.
         if s.bypass {
             for band in self.bands.iter_mut() {
-                if band.ran_mid || band.ran_side {
+                if band.ran_a || band.ran_b {
                     band.reset();
-                    band.ran_mid = false;
-                    band.ran_side = false;
+                    band.ran_a = false;
+                    band.ran_b = false;
+                    band.ran_domain = None;
                 }
             }
             return;
         }
 
+        let mut right = right;
         let stereo = right.is_some();
         let sr = self.sr;
 
-        // --- encode ---------------------------------------------------------
-        {
-            let mid = &mut self.mid_buf[..n];
-            let side = &mut self.side_buf[..n];
-            match right.as_ref() {
-                Some(r) => {
-                    for i in 0..n {
-                        mid[i] = 0.5 * (left[i] + r[i]);
-                        side[i] = 0.5 * (left[i] - r[i]);
-                    }
-                }
-                None => {
-                    mid.copy_from_slice(&left[..n]);
-                    side.fill(0.0);
-                }
-            }
+        // Snapshot the input for the sidechains before any band touches it.
+        // Mono copies left into both, which makes the mid the signal and the
+        // side silent — exactly what the M/S transform would give.
+        self.pre_l[..n].copy_from_slice(&left[..n]);
+        match right.as_deref() {
+            Some(r) => self.pre_r[..n].copy_from_slice(&r[..n]),
+            None => self.pre_r[..n].copy_from_slice(&left[..n]),
         }
 
         // --- dynamics -------------------------------------------------------
@@ -453,12 +498,17 @@ impl EqEngine {
                 continue;
             }
 
-            // A stereo band hears the mono sum, which is exactly the mid bus.
-            let src = match p.channel {
-                BandChannel::Side => &self.side_buf[..n],
-                _ => &self.mid_buf[..n],
-            };
-            self.det_buf[..n].copy_from_slice(src);
+            // Each band listens to the signal it actually filters. A stereo band
+            // hears the mono sum, which is the mid bus.
+            for i in 0..n {
+                let (l, r) = (self.pre_l[i], self.pre_r[i]);
+                self.det_buf[i] = match p.channel {
+                    BandChannel::Left => l,
+                    BandChannel::Right => r,
+                    BandChannel::Side => 0.5 * (l - r),
+                    BandChannel::Mid | BandChannel::Stereo => 0.5 * (l + r),
+                };
+            }
 
             band.update_detector(p.kind, p.freq, p.q, sr);
             let c = band.det_coeffs;
@@ -487,74 +537,98 @@ impl EqEngine {
         }
 
         // --- bands ----------------------------------------------------------
+        // The signal starts, and must end, in left/right. In between it is
+        // carried in whichever domain the band about to run needs.
+        let mut domain = Domain::LeftRight;
+
         for slot in 0..MAX_BANDS {
             let p = s.bands[slot];
-            let band = &mut self.bands[slot];
-
             let soloed_out = s.solo.is_some() && s.solo != Some(slot);
-            let (run_mid, run_side) = if !p.running || soloed_out {
-                (false, false)
-            } else {
-                (
-                    p.channel != BandChannel::Side,
-                    stereo && p.channel != BandChannel::Mid,
-                )
-            };
+            let running = p.running && !soloed_out;
 
-            // Coming back from silence with stale state in the delay line is a click.
-            if (band.ran_mid && !run_mid) || (band.ran_side && !run_side) {
+            let run_a = running && p.channel.uses_first_bus();
+            let run_b = running && stereo && p.channel.uses_second_bus();
+
+            if run_a || run_b {
+                // A stereo band asks for no domain in particular, so it runs in
+                // whichever one the chain is already in — no conversion, and the
+                // same answer, since one filter on both buses commutes with the
+                // transform between them.
+                if let (Some(want), Some(r)) = (p.channel.domain(), right.as_deref_mut()) {
+                    if domain != want {
+                        convert(left, r, n, want);
+                        domain = want;
+                    }
+                }
+            }
+
+            let band = &mut self.bands[slot];
+            // Coming back from silence with stale state in the delay line is a
+            // click, and so is state that describes the other domain's signal.
+            let domain_changed = band.ran_domain.is_some_and(|was| was != domain);
+            if (band.ran_a && !run_a) || (band.ran_b && !run_b) || domain_changed {
                 band.reset();
             }
-            band.ran_mid = run_mid;
-            band.ran_side = run_side;
-            if !run_mid && !run_side {
+            band.ran_a = run_a;
+            band.ran_b = run_b;
+            if !run_a && !run_b {
+                band.ran_domain = None;
                 continue;
             }
+            band.ran_domain = Some(domain);
 
             band.update_coeffs(p.kind, p.order, p.freq, p.q, p.gain + band.delta_db, sr);
-            if run_mid {
-                band.run(&mut self.mid_buf[..n], Bus::Mid);
+            if run_a {
+                band.run(&mut left[..n], Bus::A);
             }
-            if run_side {
-                band.run(&mut self.side_buf[..n], Bus::Side);
-            }
-        }
-
-        // Soloing a mid- or side-only band isolates that bus too, so you hear the
-        // slice on its own rather than folded back into the opposite channel.
-        if let Some(slot) = s.solo {
-            match s.bands[slot].channel {
-                BandChannel::Mid => self.side_buf[..n].fill(0.0),
-                BandChannel::Side => self.mid_buf[..n].fill(0.0),
-                BandChannel::Stereo => {}
+            if run_b {
+                if let Some(r) = right.as_deref_mut() {
+                    band.run(&mut r[..n], Bus::B);
+                }
             }
         }
 
-        // --- decode ---------------------------------------------------------
+        // Soloing a band that acts on one bus isolates that bus, so you hear the
+        // slice on its own rather than folded back into its opposite. In mono
+        // there is no opposite to drop.
+        if let (Some(slot), Some(r)) = (s.solo, right.as_deref_mut()) {
+            if let Some(want) = s.bands[slot].channel.domain() {
+                if domain != want {
+                    convert(left, r, n, want);
+                    domain = want;
+                }
+                if s.bands[slot].channel.uses_first_bus() {
+                    r[..n].fill(0.0);
+                } else {
+                    left[..n].fill(0.0);
+                }
+            }
+        }
+
+        // --- back to left/right ----------------------------------------------
+        if let Some(r) = right.as_deref_mut() {
+            if domain != Domain::LeftRight {
+                convert(left, r, n, Domain::LeftRight);
+            }
+        }
+
         let out_gain = 10f32.powf(s.output_gain_db / 20.0);
-        match right {
-            Some(r) => {
-                for i in 0..n {
-                    let (m, sd) = (self.mid_buf[i], self.side_buf[i]);
-                    left[i] = (m + sd) * out_gain;
-                    r[i] = (m - sd) * out_gain;
-                }
-                if let Some(slot) = s.solo {
-                    self.apply_solo(s.bands[slot], left, Some(r), n);
-                } else {
-                    self.clear_solo();
-                }
+        for x in left[..n].iter_mut() {
+            *x *= out_gain;
+        }
+        if let Some(r) = right.as_deref_mut() {
+            for x in r[..n].iter_mut() {
+                *x *= out_gain;
             }
-            None => {
-                for i in 0..n {
-                    left[i] = self.mid_buf[i] * out_gain;
-                }
-                if let Some(slot) = s.solo {
-                    self.apply_solo(s.bands[slot], left, None, n);
-                } else {
-                    self.clear_solo();
-                }
+        }
+
+        match s.solo {
+            Some(slot) => {
+                let plan = s.bands[slot];
+                let mut right = right;
+                self.apply_solo(plan, left, right.as_deref_mut(), n);
             }
+            None => self.clear_solo(),
         }
     }
 
@@ -822,6 +896,277 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Feed uncorrelated tones into L and R and return both channels of the tail.
+    fn run_stereo(engine: &mut EqEngine, s: &Settings, blocks: usize) -> (Vec<f32>, Vec<f32>) {
+        let (mut out_l, mut out_r) = (Vec::new(), Vec::new());
+        for block in 0..blocks {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            let mut r = [0.0f32; CONTROL_BLOCK];
+            for i in 0..CONTROL_BLOCK {
+                let t = (block * CONTROL_BLOCK + i) as f32 / SR;
+                l[i] = (2.0 * PI * 1000.0 * t).sin();
+                r[i] = (2.0 * PI * 300.0 * t).sin() * 0.7;
+            }
+            engine.process_block(&mut l, Some(&mut r), s);
+            out_l.extend_from_slice(&l);
+            out_r.extend_from_slice(&r);
+        }
+        (out_l, out_r)
+    }
+
+    #[test]
+    fn a_left_band_touches_only_the_left_channel() {
+        let mut engine = EqEngine::new(SR);
+        let s = one_band(BandPlan {
+            channel: BandChannel::Left,
+            ..bell(1000.0, 12.0, 1.0)
+        });
+
+        let (out_l, out_r) = run_stereo(&mut engine, &s, 64);
+
+        // Right is bit-identical to the untouched input.
+        for (i, sample) in out_r.iter().enumerate() {
+            let t = i as f32 / SR;
+            let expected = (2.0 * PI * 300.0 * t).sin() * 0.7;
+            assert!(
+                (sample - expected).abs() < 1e-5,
+                "right channel moved at {i}: {sample} vs {expected}"
+            );
+        }
+        // Left is boosted at the band's centre, so it must be visibly bigger.
+        let peak = out_l[out_l.len() / 2..]
+            .iter()
+            .fold(0.0f32, |acc, x| acc.max(x.abs()));
+        assert!(peak > 3.0, "left was not boosted, peak {peak}");
+    }
+
+    #[test]
+    fn a_right_band_touches_only_the_right_channel() {
+        let mut engine = EqEngine::new(SR);
+        let s = one_band(BandPlan {
+            channel: BandChannel::Right,
+            ..bell(300.0, -24.0, 1.0)
+        });
+
+        let (out_l, out_r) = run_stereo(&mut engine, &s, 64);
+
+        for (i, sample) in out_l.iter().enumerate() {
+            let t = i as f32 / SR;
+            let expected = (2.0 * PI * 1000.0 * t).sin();
+            assert!(
+                (sample - expected).abs() < 1e-5,
+                "left channel moved at {i}: {sample} vs {expected}"
+            );
+        }
+        // Right's only content sits at the band's centre and was cut hard.
+        let peak = out_r[out_r.len() / 2..]
+            .iter()
+            .fold(0.0f32, |acc, x| acc.max(x.abs()));
+        assert!(peak < 0.15, "right was not cut, peak {peak}");
+    }
+
+    /// The chain has to hop domains when a left band is followed by a mid band.
+    /// This is the whole reason the engine no longer lives in one domain, so it
+    /// is checked against the transform written out by hand.
+    #[test]
+    fn a_left_band_followed_by_a_mid_band_matches_the_transform_by_hand() {
+        let mut s = Settings::default();
+        s.bands[0] = BandPlan {
+            channel: BandChannel::Left,
+            ..bell(1500.0, 8.0, 1.5)
+        };
+        s.bands[1] = BandPlan {
+            channel: BandChannel::Mid,
+            ..bell(400.0, -7.0, 0.9)
+        };
+
+        let left_coeffs = Coeffs::peaking(1500.0, 1.5, 8.0, SR);
+        let mid_coeffs = Coeffs::peaking(400.0, 0.9, -7.0, SR);
+        let mut left_filter = Biquad::new();
+        let mut mid_filter = Biquad::new();
+
+        let mut engine = EqEngine::new(SR);
+        for block in 0..64 {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            let mut r = [0.0f32; CONTROL_BLOCK];
+            let mut want_l = [0.0f32; CONTROL_BLOCK];
+            let mut want_r = [0.0f32; CONTROL_BLOCK];
+
+            for i in 0..CONTROL_BLOCK {
+                let t = (block * CONTROL_BLOCK + i) as f32 / SR;
+                l[i] = (2.0 * PI * 1000.0 * t).sin();
+                r[i] = (2.0 * PI * 300.0 * t).sin() * 0.7;
+
+                // Left band first, on left alone...
+                let filtered_l = left_filter.process(l[i], &left_coeffs);
+                // ...then encode, filter the mid, and decode.
+                let mid = 0.5 * (filtered_l + r[i]);
+                let side = 0.5 * (filtered_l - r[i]);
+                let filtered_mid = mid_filter.process(mid, &mid_coeffs);
+                want_l[i] = filtered_mid + side;
+                want_r[i] = filtered_mid - side;
+            }
+
+            engine.process_block(&mut l, Some(&mut r), &s);
+            for i in 0..CONTROL_BLOCK {
+                assert!(
+                    (l[i] - want_l[i]).abs() < 1e-4 && (r[i] - want_r[i]).abs() < 1e-4,
+                    "block {block} sample {i}: ({}, {}) vs ({}, {})",
+                    l[i],
+                    r[i],
+                    want_l[i],
+                    want_r[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_chain_ends_in_left_right_however_many_domain_hops_it_took() {
+        // Alternating channels forces a conversion before nearly every band.
+        let mut s = Settings::default();
+        let channels = [
+            BandChannel::Left,
+            BandChannel::Mid,
+            BandChannel::Right,
+            BandChannel::Side,
+            BandChannel::Stereo,
+            BandChannel::Left,
+        ];
+        for (slot, channel) in channels.into_iter().enumerate() {
+            s.bands[slot] = BandPlan {
+                channel,
+                ..bell(200.0 * (slot + 1) as f32, 0.0, 1.0)
+            };
+        }
+
+        // Every band is at 0 dB, so whatever route the signal took through the
+        // domains, it has to come out exactly as it went in.
+        let mut engine = EqEngine::new(SR);
+        let (out_l, out_r) = run_stereo(&mut engine, &s, 32);
+        for (i, (&got_l, &got_r)) in out_l.iter().zip(out_r.iter()).enumerate() {
+            let t = i as f32 / SR;
+            let want_l = (2.0 * PI * 1000.0 * t).sin();
+            let want_r = (2.0 * PI * 300.0 * t).sin() * 0.7;
+            assert!(
+                (got_l - want_l).abs() < 1e-4 && (got_r - want_r).abs() < 1e-4,
+                "sample {i}: ({got_l}, {got_r}) vs ({want_l}, {want_r})"
+            );
+        }
+    }
+
+    #[test]
+    fn soloing_a_left_band_silences_the_right_channel() {
+        let mut s = one_band(BandPlan {
+            channel: BandChannel::Left,
+            ..bell(1000.0, 0.0, 1.0)
+        });
+        s.solo = Some(0);
+
+        let mut engine = EqEngine::new(SR);
+        let (out_l, out_r) = run_stereo(&mut engine, &s, 64);
+
+        let tail = out_r.len() / 2;
+        assert!(
+            out_r[tail..].iter().all(|x| x.abs() < 1e-6),
+            "right channel survived a left solo"
+        );
+        // And the left channel still carries its own region.
+        let peak = out_l[tail..].iter().fold(0.0f32, |acc, x| acc.max(x.abs()));
+        assert!(peak > 0.3, "soloed left band passed nothing, peak {peak}");
+    }
+
+    #[test]
+    fn soloing_a_right_band_silences_the_left_channel() {
+        let mut s = one_band(BandPlan {
+            channel: BandChannel::Right,
+            ..bell(300.0, 0.0, 1.0)
+        });
+        s.solo = Some(0);
+
+        let mut engine = EqEngine::new(SR);
+        let (out_l, _) = run_stereo(&mut engine, &s, 64);
+        let tail = out_l.len() / 2;
+        assert!(
+            out_l[tail..].iter().all(|x| x.abs() < 1e-6),
+            "left channel survived a right solo"
+        );
+    }
+
+    #[test]
+    fn mono_applies_a_left_band_and_ignores_a_right_one() {
+        let left_only = one_band(BandPlan {
+            channel: BandChannel::Left,
+            ..bell(1000.0, 6.0, 1.0)
+        });
+        let mut engine = EqEngine::new(SR);
+        let out = rms_db(&mut engine, &left_only, 1000.0, false);
+        assert!(
+            (out - (SINE_RMS_DB + 6.0)).abs() < 0.1,
+            "left band on mono gave {out} dB"
+        );
+
+        // There is no right channel to act on, so the band has nothing to do.
+        let right_only = one_band(BandPlan {
+            channel: BandChannel::Right,
+            ..bell(1000.0, 6.0, 1.0)
+        });
+        let mut engine = EqEngine::new(SR);
+        let out = rms_db(&mut engine, &right_only, 1000.0, false);
+        assert!(
+            (out - SINE_RMS_DB).abs() < 0.01,
+            "right band touched mono material: {out} dB"
+        );
+    }
+
+    #[test]
+    fn a_dynamic_left_band_listens_to_the_left_channel_alone() {
+        // Loud on the left, near-silent on the right, with the threshold between.
+        let mut s = Settings::default();
+        s.bands[0] = BandPlan {
+            channel: BandChannel::Left,
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: -30.0,
+            attack: 1.0,
+            release: 10.0,
+            ..bell(1000.0, 0.0, 1.0)
+        };
+        s.bands[1] = BandPlan {
+            channel: BandChannel::Right,
+            dynamic: true,
+            dyn_range: -12.0,
+            threshold: -30.0,
+            attack: 1.0,
+            release: 10.0,
+            ..bell(1000.0, 0.0, 1.0)
+        };
+
+        let mut engine = EqEngine::new(SR);
+        for block in 0..400 {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            let mut r = [0.0f32; CONTROL_BLOCK];
+            for i in 0..CONTROL_BLOCK {
+                let t = (block * CONTROL_BLOCK + i) as f32 / SR;
+                let x = (2.0 * PI * 1000.0 * t).sin();
+                l[i] = x;
+                r[i] = x * 0.001; // -60 dB
+            }
+            engine.process_block(&mut l, Some(&mut r), &s);
+        }
+
+        assert!(
+            engine.meter(0).delta_db < -11.0,
+            "left band did not engage: {}",
+            engine.meter(0).delta_db
+        );
+        assert!(
+            engine.meter(1).delta_db.abs() < 0.01,
+            "right band engaged on a quiet channel: {}",
+            engine.meter(1).delta_db
+        );
     }
 
     #[test]

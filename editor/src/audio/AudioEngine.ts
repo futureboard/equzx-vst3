@@ -1,5 +1,13 @@
 import { butterworthQs } from '../dsp/biquad'
-import { IS_CUT, USES_GAIN, type Band } from '../dsp/bands'
+import {
+  CHANNEL_DOMAIN,
+  IS_CUT,
+  USES_GAIN,
+  usesFirstBus,
+  usesSecondBus,
+  type Band,
+  type Domain,
+} from '../dsp/bands'
 import { dynamicStep, rmsDb } from '../dsp/dynamics'
 import {
   CURVE_POINTS,
@@ -49,16 +57,23 @@ const F_MAX = 22000
  * Web Audio graph. With every band set to stereo it is one serial chain:
  *
  *   source -> inputGain -+-> preAnalyser
- *                        +-> [detector filter -> analyser] per dynamic band
+ *                        +-> [sidechain taps] -> [detector filter -> analyser] per dynamic band
  *                        |
  *                        +-> [band biquads...] -> [solo] -> outputGain -> postAnalyser -> out
  *
- * As soon as one band is mid- or side-only the chain splits into an M/S pair,
- * and stereo bands are instantiated twice — once per side — which is identical
- * to filtering L/R, since M/S is a linear transform and the two filters match:
+ * As soon as one band is channel-specific the chain splits into a pair of buses.
+ * A band has to be filtered in the view its channel belongs to — left/right or
+ * mid/side — so the chain carries the signal in whichever one the next band
+ * needs and converts in place when it crosses between them, exactly as the
+ * plugin's Rust engine does. A conversion is a four-gain matrix:
  *
- *   inputGain -> splitter -> [0.5L+0.5R] -> midIn  -> [mid + stereo bands] -+-> merger -> ...
- *                         -> [0.5L-0.5R] -> sideIn -> [side + stereo bands] +
+ *   a -+-> [0.5] -+-> mid       mid -+-> [1] -+-> left
+ *      \-> [0.5] -+-> side          \-> [1] -+-> right
+ *   b -+-> [0.5] -/                side -+-> [ 1] -/
+ *      \-> [-0.5] /                      \-> [-1]
+ *
+ * Stereo bands are instantiated twice, once per bus, which is identical to
+ * filtering the pair directly: the transform is linear and the two filters match.
  *
  * The band nodes mirror `dsp/bands.ts` exactly (same Butterworth cascades), so the
  * drawn curve and the audible result are the same filter.
@@ -88,24 +103,28 @@ export class AudioEngine implements EqEngine {
   private soloNodes: BiquadFilterNode[] = []
   private detectors = new Map<number, Detector>()
 
-  // --- M/S encode / decode, built once and rewired per rebuild ---
+  // --- channel splitting ---
   /** Forces a stereo pair ahead of the splitter, so mono material still lands in both. */
   private stereoIn: GainNode
   private splitter: ChannelSplitterNode
   private merger: ChannelMergerNode
-  /** Encode matrix: L and R contributions to mid and to side. */
-  private encMidL: GainNode
-  private encMidR: GainNode
-  private encSideL: GainNode
-  private encSideR: GainNode
-  /** Heads of the two processing paths. */
-  private midIn: GainNode
-  private sideIn: GainNode
-  /** Decode matrix: L = mid + side, R = mid - side. */
-  private midToL: GainNode
-  private midToR: GainNode
-  private sideToL: GainNode
-  private sideToR: GainNode
+  /**
+   * Gain nodes making up the domain conversions and bus heads of the current
+   * chain. How many there are depends on the bands, so they are built per
+   * rebuild and torn down at the start of the next one.
+   */
+  private matrixNodes: GainNode[] = []
+
+  /**
+   * Permanent sidechain taps off the input, one per channel view.
+   *
+   * Dynamic bands measure the signal as it arrives rather than as earlier bands
+   * left it, so these hang off `inputGain` and never move — which also means a
+   * band changing channel re-points its detector without touching the chain.
+   */
+  private tapStereo: GainNode
+  private tapSplitter: ChannelSplitterNode
+  private taps: Record<'left' | 'right' | 'mid' | 'side', GainNode>
 
   private buffer: AudioBuffer | null = null
   private source: AudioBufferSourceNode | null = null
@@ -149,16 +168,26 @@ export class AudioEngine implements EqEngine {
     this.stereoIn.channelCount = 2
     this.stereoIn.channelCountMode = 'explicit'
     this.stereoIn.channelInterpretation = 'speakers'
-    this.encMidL = gain(0.5)
-    this.encMidR = gain(0.5)
-    this.encSideL = gain(0.5)
-    this.encSideR = gain(-0.5)
-    this.midIn = gain(1)
-    this.sideIn = gain(1)
-    this.midToL = gain(1)
-    this.midToR = gain(1)
-    this.sideToL = gain(1)
-    this.sideToR = gain(-1)
+    // Sidechain taps, wired once and left alone.
+    this.tapStereo = gain(1)
+    this.tapStereo.channelCount = 2
+    this.tapStereo.channelCountMode = 'explicit'
+    this.tapStereo.channelInterpretation = 'speakers'
+    this.tapSplitter = this.ctx.createChannelSplitter(2)
+    this.taps = { left: gain(1), right: gain(1), mid: gain(1), side: gain(1) }
+
+    this.tapStereo.connect(this.tapSplitter)
+    this.tapSplitter.connect(this.taps.left, 0)
+    this.tapSplitter.connect(this.taps.right, 1)
+    const encTap = (from: 0 | 1, to: GainNode, v: number) => {
+      const g = gain(v)
+      this.tapSplitter.connect(g, from)
+      g.connect(to)
+    }
+    encTap(0, this.taps.mid, 0.5)
+    encTap(1, this.taps.mid, 0.5)
+    encTap(0, this.taps.side, 0.5)
+    encTap(1, this.taps.side, -0.5)
 
     this.preAnalyser = this.ctx.createAnalyser()
     this.postAnalyser = this.ctx.createAnalyser()
@@ -264,58 +293,81 @@ export class AudioEngine implements EqEngine {
       for (const nodes of groups) for (const n of nodes) n.disconnect()
     }
     for (const n of this.soloNodes) n.disconnect()
+    for (const n of this.matrixNodes) n.disconnect()
     this.inputGain.disconnect()
-    for (const n of [
-      this.stereoIn, this.splitter, this.merger,
-      this.encMidL, this.encMidR, this.encSideL, this.encSideR,
-      this.midIn, this.sideIn, this.midToL, this.midToR, this.sideToL, this.sideToR,
-    ]) {
-      n.disconnect()
-    }
+    for (const n of [this.stereoIn, this.splitter, this.merger]) n.disconnect()
+
     this.inputGain.connect(this.preAnalyser)
+    this.inputGain.connect(this.tapStereo)
 
     this.bandNodes = new Map()
     this.soloNodes = []
+    this.matrixNodes = []
 
     const active = this.activeBands()
     const soloBand = this.soloId !== null ? (this.bands.find((b) => b.id === this.soloId) ?? null) : null
-    const ms = active.some((b) => b.channel !== 'stereo')
+    const split = active.some((b) => b.channel !== 'stereo')
 
     let tail: AudioNode = this.inputGain
-    if (ms) {
-      this.encode()
-      let midTail: AudioNode = this.midIn
-      let sideTail: AudioNode = this.sideIn
+    if (split) {
+      // The pair starts, and must end, as left/right.
+      this.inputGain.connect(this.stereoIn)
+      this.stereoIn.connect(this.splitter)
+      let a: AudioNode = this.busHead(this.splitter, 0)
+      let b: AudioNode = this.busHead(this.splitter, 1)
+      let domain: Domain = 'lr'
 
       for (const band of active) {
+        // A stereo band asks for no domain in particular, so it runs in whichever
+        // one the chain is already in — one filter on both buses commutes with
+        // the transform between them.
+        const want = CHANNEL_DOMAIN[band.channel]
+        if (want && want !== domain) {
+          ;[a, b] = this.convert(a, b, want)
+          domain = want
+        }
+
         const groups: BiquadFilterNode[][] = []
-        if (band.channel !== 'side') {
+        if (usesFirstBus(band.channel)) {
           const nodes = this.createBandNodes(band)
           for (const n of nodes) {
-            midTail.connect(n)
-            midTail = n
+            a.connect(n)
+            a = n
           }
           groups.push(nodes)
         }
-        if (band.channel !== 'mid') {
+        if (usesSecondBus(band.channel)) {
           const nodes = this.createBandNodes(band)
           for (const n of nodes) {
-            sideTail.connect(n)
-            sideTail = n
+            b.connect(n)
+            b = n
           }
           groups.push(nodes)
         }
         this.bandNodes.set(band.id, groups)
       }
 
-      // Soloing a single-channel band also isolates that channel, so you hear the
-      // mid (or the side) alone rather than its filtered slice folded back in.
-      this.setBusGain(this.midToL, soloBand?.channel === 'side' ? 0 : 1)
-      this.setBusGain(this.midToR, soloBand?.channel === 'side' ? 0 : 1)
-      this.setBusGain(this.sideToL, soloBand?.channel === 'mid' ? 0 : 1)
-      this.setBusGain(this.sideToR, soloBand?.channel === 'mid' ? 0 : -1)
+      // Soloing a band that acts on one bus isolates that bus, so you hear the
+      // slice on its own rather than folded back into its opposite.
+      const soloDomain = soloBand ? CHANNEL_DOMAIN[soloBand.channel] : null
+      if (soloBand && soloDomain) {
+        if (soloDomain !== domain) {
+          ;[a, b] = this.convert(a, b, soloDomain)
+          domain = soloDomain
+        }
+        const mute = this.matrixGain(0)
+        if (usesFirstBus(soloBand.channel)) {
+          b.connect(mute)
+          b = mute
+        } else {
+          a.connect(mute)
+          a = mute
+        }
+      }
 
-      this.decode(midTail, sideTail)
+      if (domain !== 'lr') [a, b] = this.convert(a, b, 'lr')
+      a.connect(this.merger, 0, 0)
+      b.connect(this.merger, 0, 1)
       tail = this.merger
     } else {
       for (const band of active) {
@@ -341,34 +393,42 @@ export class AudioEngine implements EqEngine {
     this.topology = this.signature()
   }
 
-  /** L/R -> mid, side. */
-  private encode() {
-    this.inputGain.connect(this.stereoIn)
-    this.stereoIn.connect(this.splitter)
-    this.splitter.connect(this.encMidL, 0)
-    this.splitter.connect(this.encMidR, 1)
-    this.splitter.connect(this.encSideL, 0)
-    this.splitter.connect(this.encSideR, 1)
-    this.encMidL.connect(this.midIn)
-    this.encMidR.connect(this.midIn)
-    this.encSideL.connect(this.sideIn)
-    this.encSideR.connect(this.sideIn)
+  /** A gain node belonging to the current chain, torn down on the next rebuild. */
+  private matrixGain(value: number): GainNode {
+    const g = this.ctx.createGain()
+    g.gain.value = value
+    this.matrixNodes.push(g)
+    return g
   }
 
-  /** mid, side -> L/R. Merger inputs sum, so the four decode legs recombine there. */
-  private decode(midTail: AudioNode, sideTail: AudioNode) {
-    midTail.connect(this.midToL)
-    midTail.connect(this.midToR)
-    sideTail.connect(this.sideToL)
-    sideTail.connect(this.sideToR)
-    this.midToL.connect(this.merger, 0, 0)
-    this.sideToL.connect(this.merger, 0, 0)
-    this.midToR.connect(this.merger, 0, 1)
-    this.sideToR.connect(this.merger, 0, 1)
+  /** One output of the splitter, as a node the chain can build onto. */
+  private busHead(from: ChannelSplitterNode, channel: 0 | 1): GainNode {
+    const head = this.matrixGain(1)
+    from.connect(head, channel)
+    return head
   }
 
-  private setBusGain(node: GainNode, v: number) {
-    node.gain.setTargetAtTime(v, this.ctx.currentTime, 0.01)
+  /**
+   * Move the pair between domains, returning the new bus heads.
+   *
+   * Encoding is (a+b)/2 and (a-b)/2; decoding sums and differences them straight
+   * back. Four gains into two summing nodes — Web Audio adds everything that
+   * lands on the same input, so the matrix needs no explicit adder.
+   */
+  private convert(a: AudioNode, b: AudioNode, to: Domain): [AudioNode, AudioNode] {
+    const [aa, ab, ba, bb] = to === 'ms' ? [0.5, 0.5, 0.5, -0.5] : [1, 1, 1, -1]
+    const outA = this.matrixGain(1)
+    const outB = this.matrixGain(1)
+    const leg = (from: AudioNode, to_: GainNode, v: number) => {
+      const g = this.matrixGain(v)
+      from.connect(g)
+      g.connect(to_)
+    }
+    leg(a, outA, aa)
+    leg(b, outA, ab)
+    leg(a, outB, ba)
+    leg(b, outB, bb)
+    return [outA, outB]
   }
 
   private createBandNodes(band: Band): BiquadFilterNode[] {
@@ -467,13 +527,16 @@ export class AudioEngine implements EqEngine {
   // --- dynamics ----------------------------------------------------------
 
   /**
-   * A dynamic band should react to the signal it actually filters, so a mid- or
-   * side-only band listens to its own bus — but only while the M/S graph exists.
+   * A dynamic band reacts to the signal it actually filters, so it listens to
+   * the tap for its own channel. A stereo band hears the mono sum, which is what
+   * an AnalyserNode on the input would measure anyway — and is the mid tap.
+   *
+   * The taps hang off the input rather than off the chain, so this is the same
+   * answer whatever the bands around it are doing.
    */
   private detectorSource(band: Band | undefined): AudioNode {
-    if (!band || band.channel === 'stereo') return this.inputGain
-    if (!this.activeBands().some((b) => b.channel !== 'stereo')) return this.inputGain
-    return band.channel === 'mid' ? this.midIn : this.sideIn
+    if (!band || band.channel === 'stereo') return this.taps.mid
+    return this.taps[band.channel]
   }
 
   /** (Re)wire every detector's input. Safe to call repeatedly — edges are deduped. */

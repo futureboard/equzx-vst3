@@ -30,7 +30,9 @@ use crate::protocol::{
     FrameMessage, StateMessage,
 };
 
-pub const DEFAULT_WIDTH: u32 = 1180;
+/// Wide enough for the band editor's full control row — type, frequency,
+/// gain, Q, slope, all five channels, and the on/solo/delete group.
+pub const DEFAULT_WIDTH: u32 = 1260;
 pub const DEFAULT_HEIGHT: u32 = 760;
 /// Analyser frames per second. The curve is smoothed across frames anyway, so
 /// past this the extra traffic buys nothing the eye can use.

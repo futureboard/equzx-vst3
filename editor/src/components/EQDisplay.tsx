@@ -12,6 +12,7 @@ import {
   bandColor,
   bandInView,
   bandSections,
+  channelBadge,
   sectionsDbAt,
   type Band,
   type ChannelView,
@@ -35,7 +36,8 @@ interface Props {
   onPatch: (id: number, patch: Partial<Band>) => void
   onSelect: (id: number | null) => void
   onSolo: (id: number | null) => void
-  onAdd: (freq: number, gain: number) => void
+  /** Creates a band and returns its id, or null when the bank is full. */
+  onAdd: (freq: number, gain: number) => number | null
   onRemove: (id: number) => void
 }
 
@@ -107,7 +109,6 @@ export function EQDisplay({
   const [size, setSize] = useState({ w: 900, h: 460 })
   const [hoverId, setHoverId] = useState<number | null>(null)
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null)
-  const justDragged = useRef(false)
 
   /**
    * Right-button drag on a handle: solo the band for as long as the button is
@@ -279,19 +280,61 @@ export function EQDisplay({
     return { px: ev.clientX - rect.left - PAD.left, py: ev.clientY - rect.top - PAD.top }
   }, [])
 
-  /** A single click on empty display creates a band there, Pro-Q style. */
-  const handleClick = useCallback(
-    (ev: React.MouseEvent) => {
-      if (justDragged.current) return
+  /**
+   * Press on empty display to create a band, then drag it into place without
+   * letting go.
+   *
+   * The band is created on *press*, not on release, so it is on screen and
+   * following the pointer for the whole gesture — press, sweep to the frequency
+   * you want, release. Waiting for the click to complete meant drawing blind and
+   * only seeing the result once the mouse was already up.
+   */
+  const draft = useRef<{ id: number; pointerId: number } | null>(null)
+
+  const handlePointerDown = useCallback(
+    (ev: React.PointerEvent<SVGSVGElement>) => {
+      // Right-drag is the audition gesture, and the handles own their own drags.
+      if (ev.button !== 0) return
       const el = ev.target as Element
       if (el.closest('[data-handle]') || el.closest('[data-qhandle]')) return
       if (!canAdd) return
       const { px, py } = toLocal(ev)
       if (px < 0 || px > inner.w || py < 0 || py > inner.h) return
-      onAdd(clamp(x.invert(px), F_MIN, F_MAX), clamp(y.invert(py), -dbRange, dbRange))
+
+      const id = onAdd(clamp(x.invert(px), F_MIN, F_MAX), clamp(y.invert(py), -dbRange, dbRange))
+      if (id === null) return
+
+      draft.current = { id, pointerId: ev.pointerId }
+      // Capture so the band keeps following even when the pointer leaves the plot.
+      ev.currentTarget.setPointerCapture(ev.pointerId)
     },
     [toLocal, x, y, dbRange, onAdd, canAdd, inner.w, inner.h],
   )
+
+  const handlePointerMove = useCallback(
+    (ev: React.PointerEvent<SVGSVGElement>) => {
+      const { px, py } = toLocal(ev)
+      setCursor({ x: px, y: py })
+
+      const active = draft.current
+      if (!active || active.pointerId !== ev.pointerId) return
+      // The band was created under the pointer, so it tracks it outright rather
+      // than by delta — no accumulated drift over a long sweep.
+      onPatch(active.id, {
+        freq: clamp(x.invert(px), F_MIN, F_MAX),
+        gain: clamp(y.invert(py), -dbRange, dbRange),
+      })
+    },
+    [toLocal, x, y, dbRange, onPatch],
+  )
+
+  const endDraft = useCallback((ev: React.PointerEvent<SVGSVGElement>) => {
+    if (draft.current?.pointerId !== ev.pointerId) return
+    draft.current = null
+    if (ev.currentTarget.hasPointerCapture(ev.pointerId)) {
+      ev.currentTarget.releasePointerCapture(ev.pointerId)
+    }
+  }, [])
 
   const handleWheelNative = useCallback(
     (ev: WheelEvent) => {
@@ -332,7 +375,6 @@ export function EQDisplay({
         ev.sourceEvent.stopPropagation()
       })
       .on('drag', function (ev) {
-        justDragged.current = true
         const id = Number(this.dataset.handle)
         const band = live.current.bands.find((b) => b.id === id)
         if (!band) return
@@ -349,7 +391,6 @@ export function EQDisplay({
     const qDrag = d3
       .drag<SVGGElement, unknown>()
       .on('drag', function (ev) {
-        justDragged.current = true
         const id = Number(this.dataset.qhandle)
         const side = Number(this.dataset.side)
         const band = live.current.bands.find((b) => b.id === id)
@@ -385,13 +426,11 @@ export function EQDisplay({
       <svg
         ref={svgRef}
         className={`absolute inset-0 h-full w-full ${canAdd ? 'cursor-crosshair' : 'cursor-not-allowed'}`}
-        onClick={handleClick}
         onContextMenu={(ev) => ev.preventDefault()}
-        onPointerDown={() => (justDragged.current = false)}
-        onMouseMove={(ev) => {
-          const { px, py } = toLocal(ev)
-          setCursor({ x: px, y: py })
-        }}
+        onPointerDown={handlePointerDown}
+        onPointerMove={handlePointerMove}
+        onPointerUp={endDraft}
+        onPointerCancel={endDraft}
         onMouseLeave={() => setCursor(null)}
       >
         <g transform={`translate(${PAD.left},${PAD.top})`}>
@@ -497,7 +536,6 @@ export function EQDisplay({
                   onPointerMove={(ev) => {
                     const a = audition.current
                     if (!a || a.pointerId !== ev.pointerId) return
-                    justDragged.current = true
                     const fine = ev.shiftKey ? 0.25 : 1
                     const px = x(a.startFreq) + (ev.clientX - a.startX) * fine
                     onPatch(a.id, { freq: clamp(x.invert(px), F_MIN, F_MAX) })
@@ -554,7 +592,7 @@ export function EQDisplay({
                       fill={color}
                       className="pointer-events-none text-[9px] font-bold"
                     >
-                      {band.channel === 'mid' ? 'M' : 'S'}
+                      {channelBadge(band.channel)}
                     </text>
                   )}
                 </g>

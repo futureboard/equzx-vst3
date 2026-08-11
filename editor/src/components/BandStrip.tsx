@@ -5,6 +5,7 @@ import type { EqEngine } from '../audio/engine'
 import { NEON } from '../theme'
 import {
   BAND_CHANNELS,
+  channelBadge,
   BAND_TYPES,
   IS_CUT,
   MAX_BANDS,
@@ -116,7 +117,7 @@ export function BandStrip({
                     className="absolute bottom-0 right-0.5 text-[7px] font-bold leading-none"
                     style={{ color: active ? '#000' : bandColor(i) }}
                   >
-                    {b.channel === 'mid' ? 'M' : 'S'}
+                    {channelBadge(b.channel)}
                   </span>
                 )}
               </button>
@@ -226,7 +227,7 @@ export function BandStrip({
                     title={`${c.label} — ${
                       c.value === 'stereo' ? 'both channels' : `the ${c.label.toLowerCase()} signal only`
                     }`}
-                    className={`px-2.5 py-1.5 text-[10px] transition ${
+                    className={`px-2 py-1.5 text-[10px] transition ${
                       band.channel === c.value
                         ? 'text-black'
                         : 'text-white/45 hover:bg-white/8 hover:text-white/80'
@@ -237,7 +238,7 @@ export function BandStrip({
                   </button>
                 ))}
               </div>
-              <div className="text-[9px] text-white/25">mid / side</div>
+              <div className="text-[9px] text-white/25">L/R · mid/side</div>
             </div>
 
             <div className="ml-auto flex items-center gap-1.5">

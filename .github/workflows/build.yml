@@ -1,0 +1,128 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing shouldn't hide whether the other one works.
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+          - name: macos
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(python3 -c 'import json; print(json.load(open("version.json"))["version"])')" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # The macOS bundle is universal, which means building both halves.
+          targets: ${{ matrix.name == 'macos' && 'x86_64-apple-darwin,aarch64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The UI is compiled into the plugin binary, so it has to exist first —
+      # otherwise `build.rs` bakes in its "UI not built" placeholder.
+      - name: Build the editor
+        working-directory: editor
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Bundle (Windows)
+        if: matrix.name == 'windows'
+        run: cargo xtask bundle equzx --release
+
+      - name: Bundle (macOS universal)
+        if: matrix.name == 'macos'
+        run: cargo xtask bundle-universal equzx --release
+
+      - name: Check the bundles came out as plug-ins
+        shell: bash
+        run: |
+          set -e
+          test -d target/bundled/EQUZX.vst3 || { echo "no VST3 bundle"; exit 1; }
+          if [ "${{ matrix.name }}" = "windows" ]; then
+            test -f target/bundled/EQUZX.vst3/Contents/x86_64-win/EQUZX.vst3
+            test -f target/bundled/EQUZX.clap
+          else
+            test -f target/bundled/EQUZX.vst3/Contents/MacOS/EQUZX
+            test -d target/bundled/EQUZX.clap
+            # Universal means both slices are actually in there.
+            lipo -archs target/bundled/EQUZX.vst3/Contents/MacOS/EQUZX | tee /dev/stderr | grep -q x86_64
+            lipo -archs target/bundled/EQUZX.vst3/Contents/MacOS/EQUZX | grep -q arm64
+          fi
+
+      - name: Installer (Windows, Inno Setup)
+        if: matrix.name == 'windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc /DVersion=${{ steps.version.outputs.version }} installer\windows\equzx.iss
+
+      - name: Installer (macOS, pkg)
+        if: matrix.name == 'macos'
+        run: |
+          chmod +x installer/macos/build-pkg.sh
+          installer/macos/build-pkg.sh
+
+      - name: Upload plug-ins
+        uses: actions/upload-artifact@v4
+        with:
+          name: EQUZX-${{ steps.version.outputs.version }}-${{ matrix.name }}-plugins
+          path: target/bundled/
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: EQUZX-${{ steps.version.outputs.version }}-${{ matrix.name }}-installer
+          path: target/installer/
+
+  release:
+    # Tag pushes publish; everything else just leaves artifacts on the run.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-installer"
+          path: installers
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: installers/*
+          generate_release_notes: true

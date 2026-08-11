@@ -27,6 +27,8 @@ const RANGES = [6, 12, 18, 30];
 
 const VIEWS: { value: ChannelView; label: string }[] = [
   { value: "all", label: "Stereo" },
+  { value: "left", label: "Left" },
+  { value: "right", label: "Right" },
   { value: "mid", label: "Mid" },
   { value: "side", label: "Side" },
 ];

@@ -83,6 +83,12 @@ impl BandKind {
     }
 }
 
+/// Which part of the signal a band acts on.
+///
+/// Left/Right are appended rather than slotted in next to Stereo on purpose.
+/// Sessions store an enum by its `id` string so the order doesn't affect recall,
+/// but a VST3 host's automation lane is a normalized float over the variant
+/// count — reordering would move every existing lane.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BandChannel {
     #[id = "stereo"]
@@ -91,6 +97,10 @@ pub enum BandChannel {
     Mid,
     #[id = "side"]
     Side,
+    #[id = "left"]
+    Left,
+    #[id = "right"]
+    Right,
 }
 
 impl BandChannel {
@@ -99,6 +109,8 @@ impl BandChannel {
             BandChannel::Stereo => "stereo",
             BandChannel::Mid => "mid",
             BandChannel::Side => "side",
+            BandChannel::Left => "left",
+            BandChannel::Right => "right",
         }
     }
 
@@ -107,9 +119,42 @@ impl BandChannel {
             "stereo" => BandChannel::Stereo,
             "mid" => BandChannel::Mid,
             "side" => BandChannel::Side,
+            "left" => BandChannel::Left,
+            "right" => BandChannel::Right,
             _ => return None,
         })
     }
+
+    /// The domain this band has to be filtered in. `None` for stereo, which is
+    /// the same filter on both buses and so gives the same answer either way.
+    pub fn domain(self) -> Option<Domain> {
+        match self {
+            BandChannel::Stereo => None,
+            BandChannel::Mid | BandChannel::Side => Some(Domain::MidSide),
+            BandChannel::Left | BandChannel::Right => Some(Domain::LeftRight),
+        }
+    }
+
+    /// Does this band act on the first bus of its domain — left, or mid?
+    pub fn uses_first_bus(self) -> bool {
+        !matches!(self, BandChannel::Side | BandChannel::Right)
+    }
+
+    /// And on the second — right, or side?
+    pub fn uses_second_bus(self) -> bool {
+        !matches!(self, BandChannel::Mid | BandChannel::Left)
+    }
+}
+
+/// Which pair of buses the signal is currently carried on.
+///
+/// Left/right and mid/side are two views of the same stereo signal, related by
+/// an exactly invertible transform, so the EQ moves between them as it walks the
+/// band list rather than committing to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Domain {
+    LeftRight,
+    MidSide,
 }
 
 /// Cut slopes, in dB/oct. Only even filter orders exist, hence multiples of 12.

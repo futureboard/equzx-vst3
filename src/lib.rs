@@ -18,6 +18,7 @@ pub mod editor;
 pub mod meters;
 pub mod params;
 pub mod protocol;
+pub mod version;
 
 use crate::analyzer::Taps;
 use crate::dsp::engine::{settings_for_block, EqEngine, CONTROL_BLOCK};

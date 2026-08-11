@@ -1,6 +1,7 @@
 [package]
 name = "equzx"
-version = "0.1.0"
+# CalVer, kept in step with `version.json` — see `src/version.rs`.
+version = "2026.8.11"
 edition = "2021"
 authors = ["Futureboard Digital Technologies"]
 license = "proprietary"

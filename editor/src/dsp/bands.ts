@@ -27,13 +27,47 @@ export type BandType =
  * Which part of the stereo image a band acts on. Mid is (L+R)/2, side is (L-R)/2;
  * a 'stereo' band is simply the same filter applied to both.
  */
-export type BandChannel = 'stereo' | 'mid' | 'side'
+export type BandChannel = 'stereo' | 'left' | 'right' | 'mid' | 'side'
 
 export const BAND_CHANNELS: { value: BandChannel; label: string; short: string }[] = [
   { value: 'stereo', label: 'Stereo', short: 'ST' },
+  { value: 'left', label: 'Left', short: 'L' },
+  { value: 'right', label: 'Right', short: 'R' },
   { value: 'mid', label: 'Mid', short: 'M' },
   { value: 'side', label: 'Side', short: 'S' },
 ]
+
+/**
+ * Left/right and mid/side are two views of the same stereo signal, and a band
+ * has to be filtered in the one its channel belongs to — a left-only filter is
+ * not expressible as a pair of independent mid and side filters. `null` is a
+ * stereo band, which is the same filter on both buses and so gives the same
+ * answer in either view.
+ */
+export type Domain = 'lr' | 'ms'
+
+export const CHANNEL_DOMAIN: Record<BandChannel, Domain | null> = {
+  stereo: null,
+  left: 'lr',
+  right: 'lr',
+  mid: 'ms',
+  side: 'ms',
+}
+
+/** Does this band act on the first bus of its domain — left, or mid? */
+export function usesFirstBus(channel: BandChannel): boolean {
+  return channel !== 'side' && channel !== 'right'
+}
+
+/** And on the second — right, or side? */
+export function usesSecondBus(channel: BandChannel): boolean {
+  return channel !== 'mid' && channel !== 'left'
+}
+
+/** The one-letter badge the band list and display use. */
+export function channelBadge(channel: BandChannel): string {
+  return channel === 'stereo' ? '' : channel[0].toUpperCase()
+}
 
 export interface Band {
   id: number
@@ -232,7 +266,7 @@ export function defaultBands(): Band[] {
 }
 
 /** Which slice of the stereo image the display is showing. */
-export type ChannelView = 'all' | 'mid' | 'side'
+export type ChannelView = 'all' | 'left' | 'right' | 'mid' | 'side'
 
 /** Does a band act on the channel currently being viewed? */
 export function bandInView(band: Band, view: ChannelView): boolean {
