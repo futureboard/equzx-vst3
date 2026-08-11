@@ -1,0 +1,33 @@
+[package]
+name = "equzx"
+version = "0.1.0"
+edition = "2021"
+authors = ["Futureboard Digital Technologies"]
+license = "proprietary"
+description = "EQUZX — dynamic mid/side parametric EQ"
+
+[workspace]
+members = ["xtask", "webview"]
+
+[lib]
+# `cdylib` is the plugin itself; `lib` keeps the DSP unit-testable.
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", features = ["standalone"] }
+# Vendored — see `webview/README.md` for why it isn't pulled from git.
+nih_plug_webview = { path = "webview" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+realfft = "3.3"
+include_dir = "0.7"
+base64 = "0.22"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = "none"

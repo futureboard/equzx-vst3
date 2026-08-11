@@ -1,0 +1,407 @@
+//! Plugin parameters.
+//!
+//! The UI presents an EQ you add and remove bands from, but a VST3/CLAP host
+//! needs a parameter list that never changes shape. Both are satisfied by a
+//! fixed array of [`MAX_BANDS`] slots: a slot carries an `active` flag, and
+//! "adding a band" is really claiming the first inactive slot. A band's slot
+//! index is its identity — it is the `id` the web UI works with — so automation
+//! lanes stay attached to the band the user drew.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+
+use nih_plug::prelude::*;
+
+/// Matches `MAX_BANDS` in `editor/src/dsp/bands.ts`.
+pub const MAX_BANDS: usize = 24;
+
+/// dB past the threshold at which a dynamic band reaches its full range.
+/// Mirrors `DYN_KNEE_DB` on the UI side.
+pub const DYN_KNEE_DB: f32 = 6.0;
+
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandKind {
+    #[id = "lowcut"]
+    #[name = "Low Cut"]
+    LowCut,
+    #[id = "lowshelf"]
+    #[name = "Low Shelf"]
+    LowShelf,
+    #[id = "bell"]
+    Bell,
+    #[id = "notch"]
+    Notch,
+    #[id = "bandpass"]
+    #[name = "Band Pass"]
+    BandPass,
+    #[id = "highshelf"]
+    #[name = "High Shelf"]
+    HighShelf,
+    #[id = "highcut"]
+    #[name = "High Cut"]
+    HighCut,
+}
+
+impl BandKind {
+    /// Cut types are Butterworth cascades; everything else is a single section.
+    pub fn is_cut(self) -> bool {
+        matches!(self, BandKind::LowCut | BandKind::HighCut)
+    }
+
+    /// Only these types have a gain to move, so only these can be dynamic.
+    pub fn uses_gain(self) -> bool {
+        matches!(
+            self,
+            BandKind::LowShelf | BandKind::Bell | BandKind::HighShelf
+        )
+    }
+
+    /// The name the web UI uses for this type.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            BandKind::LowCut => "lowcut",
+            BandKind::LowShelf => "lowshelf",
+            BandKind::Bell => "bell",
+            BandKind::Notch => "notch",
+            BandKind::BandPass => "bandpass",
+            BandKind::HighShelf => "highshelf",
+            BandKind::HighCut => "highcut",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "lowcut" => BandKind::LowCut,
+            "lowshelf" => BandKind::LowShelf,
+            "bell" => BandKind::Bell,
+            "notch" => BandKind::Notch,
+            "bandpass" => BandKind::BandPass,
+            "highshelf" => BandKind::HighShelf,
+            "highcut" => BandKind::HighCut,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandChannel {
+    #[id = "stereo"]
+    Stereo,
+    #[id = "mid"]
+    Mid,
+    #[id = "side"]
+    Side,
+}
+
+impl BandChannel {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            BandChannel::Stereo => "stereo",
+            BandChannel::Mid => "mid",
+            BandChannel::Side => "side",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "stereo" => BandChannel::Stereo,
+            "mid" => BandChannel::Mid,
+            "side" => BandChannel::Side,
+            _ => return None,
+        })
+    }
+}
+
+/// Cut slopes, in dB/oct. Only even filter orders exist, hence multiples of 12.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slope {
+    #[id = "12"]
+    #[name = "12 dB/oct"]
+    S12,
+    #[id = "24"]
+    #[name = "24 dB/oct"]
+    S24,
+    #[id = "36"]
+    #[name = "36 dB/oct"]
+    S36,
+    #[id = "48"]
+    #[name = "48 dB/oct"]
+    S48,
+    #[id = "72"]
+    #[name = "72 dB/oct"]
+    S72,
+    #[id = "96"]
+    #[name = "96 dB/oct"]
+    S96,
+}
+
+impl Slope {
+    pub fn db_per_oct(self) -> u32 {
+        match self {
+            Slope::S12 => 12,
+            Slope::S24 => 24,
+            Slope::S36 => 36,
+            Slope::S48 => 48,
+            Slope::S72 => 72,
+            Slope::S96 => 96,
+        }
+    }
+
+    /// Filter order — the cascade holds half this many second-order sections.
+    pub fn order(self) -> usize {
+        (self.db_per_oct() / 6) as usize
+    }
+
+    pub fn from_db_per_oct(v: u32) -> Option<Self> {
+        Some(match v {
+            12 => Slope::S12,
+            24 => Slope::S24,
+            36 => Slope::S36,
+            48 => Slope::S48,
+            72 => Slope::S72,
+            96 => Slope::S96,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynMode {
+    /// Engages once the band's level rises past the threshold.
+    #[id = "above"]
+    Above,
+    /// Engages once it falls below it.
+    #[id = "below"]
+    Below,
+}
+
+impl DynMode {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            DynMode::Above => "above",
+            DynMode::Below => "below",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "above" => DynMode::Above,
+            "below" => DynMode::Below,
+            _ => return None,
+        })
+    }
+}
+
+/// One band slot. Ranges match `sanitizeBand` in `editor/src/state/presets.ts`,
+/// so a preset written by the UI always round-trips through the parameters.
+#[derive(Params)]
+pub struct BandParams {
+    /// Is this slot in use at all? Distinct from `enabled`, which is the user's
+    /// per-band on/off switch — an inactive slot isn't drawn or listed.
+    #[id = "act"]
+    pub active: BoolParam,
+    #[id = "en"]
+    pub enabled: BoolParam,
+    #[id = "type"]
+    pub kind: EnumParam<BandKind>,
+    #[id = "ch"]
+    pub channel: EnumParam<BandChannel>,
+    #[id = "f"]
+    pub freq: FloatParam,
+    #[id = "g"]
+    pub gain: FloatParam,
+    #[id = "q"]
+    pub q: FloatParam,
+    #[id = "sl"]
+    pub slope: EnumParam<Slope>,
+
+    #[id = "dyn"]
+    pub dynamic: BoolParam,
+    #[id = "dm"]
+    pub dyn_mode: EnumParam<DynMode>,
+    #[id = "dr"]
+    pub dyn_range: FloatParam,
+    #[id = "th"]
+    pub threshold: FloatParam,
+    #[id = "at"]
+    pub attack: FloatParam,
+    #[id = "rl"]
+    pub release: FloatParam,
+}
+
+impl Default for BandParams {
+    fn default() -> Self {
+        Self {
+            active: BoolParam::new("Active", false),
+            enabled: BoolParam::new("Enabled", true),
+            kind: EnumParam::new("Type", BandKind::Bell),
+            channel: EnumParam::new("Channel", BandChannel::Stereo),
+
+            freq: FloatParam::new(
+                "Frequency",
+                1000.0,
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 22_000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_smoother(SmoothingStyle::Logarithmic(20.0))
+            .with_unit(" Hz")
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+
+            gain: FloatParam::new(
+                "Gain",
+                0.0,
+                FloatRange::Linear {
+                    min: -30.0,
+                    max: 30.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            q: FloatParam::new(
+                "Q",
+                1.0,
+                FloatRange::Skewed {
+                    min: 0.025,
+                    max: 40.0,
+                    factor: FloatRange::skew_factor(-1.0),
+                },
+            )
+            .with_smoother(SmoothingStyle::Logarithmic(20.0))
+            .with_value_to_string(formatters::v2s_f32_rounded(3)),
+
+            slope: EnumParam::new("Slope", Slope::S24),
+
+            dynamic: BoolParam::new("Dynamic", false),
+            dyn_mode: EnumParam::new("Dyn Mode", DynMode::Above),
+            dyn_range: FloatParam::new(
+                "Dyn Range",
+                -6.0,
+                FloatRange::Linear {
+                    min: -30.0,
+                    max: 30.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+            threshold: FloatParam::new(
+                "Threshold",
+                -24.0,
+                FloatRange::Linear {
+                    min: -70.0,
+                    max: 0.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            attack: FloatParam::new(
+                "Attack",
+                20.0,
+                FloatRange::Skewed {
+                    min: 1.0,
+                    max: 300.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+            release: FloatParam::new(
+                "Release",
+                200.0,
+                FloatRange::Skewed {
+                    min: 10.0,
+                    max: 2000.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
+        }
+    }
+}
+
+#[derive(Params)]
+pub struct EquzxParams {
+    #[id = "bypass"]
+    pub bypass: BoolParam,
+    #[id = "outgain"]
+    pub output_gain: FloatParam,
+
+    #[nested(array, group = "Band")]
+    pub bands: [BandParams; MAX_BANDS],
+
+    /// View state the DAW should remember but never automate: analyser mode,
+    /// dB range, panel height, the parked A/B slot. Opaque JSON owned by the UI.
+    #[persist = "ui"]
+    pub ui_state: Arc<RwLock<String>>,
+}
+
+impl Default for EquzxParams {
+    fn default() -> Self {
+        Self {
+            // Declared as a real bypass so hosts wire it to their own bypass button.
+            bypass: BoolParam::new("Bypass", false)
+                .with_value_to_string(formatters::v2s_bool_bypass())
+                .with_string_to_value(formatters::s2v_bool_bypass())
+                .make_bypass(),
+            output_gain: FloatParam::new(
+                "Output Gain",
+                0.0,
+                FloatRange::Linear {
+                    min: -24.0,
+                    max: 12.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(20.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            bands: std::array::from_fn(|_| BandParams::default()),
+            ui_state: Arc::new(RwLock::new(String::new())),
+        }
+    }
+}
+
+/// State the UI drives that isn't automatable and shouldn't be saved with the
+/// session: which band is currently soloed.
+///
+/// Solo is a monitoring action, not part of the sound the user is designing, so
+/// it lives outside the parameter list. `-1` means nothing is soloed.
+pub struct TransientState {
+    solo: std::sync::atomic::AtomicI32,
+    /// Set by the editor when it wants the DSP to drop filter state — e.g. after
+    /// loading a preset that moves every band at once.
+    pub flush: AtomicBool,
+}
+
+impl Default for TransientState {
+    fn default() -> Self {
+        Self {
+            solo: std::sync::atomic::AtomicI32::new(-1),
+            flush: AtomicBool::new(false),
+        }
+    }
+}
+
+impl TransientState {
+    pub fn solo(&self) -> Option<usize> {
+        let v = self.solo.load(Ordering::Relaxed);
+        if v < 0 || v as usize >= MAX_BANDS {
+            None
+        } else {
+            Some(v as usize)
+        }
+    }
+
+    pub fn set_solo(&self, slot: Option<usize>) {
+        self.solo
+            .store(slot.map(|s| s as i32).unwrap_or(-1), Ordering::Relaxed);
+    }
+}

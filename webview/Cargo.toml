@@ -1,0 +1,28 @@
+[package]
+name = "nih_plug_webview"
+version = "0.0.0"
+edition = "2021"
+authors = ["Max Huttunen <max.huttunen@gmail.com>"]
+license = "ISC"
+description = "An adapter to use webview GUIs with NIH-plug (vendored, see README)"
+publish = false
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git" }
+parking_lot = "0.12.1"
+serde_json = "1.0"
+wry = { version = "0.35.1" }
+# Pinned deliberately. Upstream tracks baseview's git HEAD, and baseview has
+# since rewritten its windowing API and moved to raw-window-handle 0.6; this is
+# the last commit of the API this adapter is written against.
+baseview = { git = "https://github.com/RustAudio/baseview", rev = "3724a00c970a9cd10a3494fa3c37bca66d631bb7" }
+raw-window-handle = "0.5"
+crossbeam = "0.8.2"
+keyboard-types = "0.6.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Same major as wry 0.35 pulls in, so the two share one copy.
+windows = { version = "0.52", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+] }
