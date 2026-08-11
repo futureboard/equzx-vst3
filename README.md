@@ -34,7 +34,7 @@ Both formats are *directory bundles* on both platforms, and the `.vst3` /
 `.clap` suffix on the outer directory is how a host finds them — a bundle that
 has been renamed or flattened into a bare `.dll` is invisible. On Windows the
 binary inside is itself named `EQUZX.vst3`
-(`EQUZX.vst3\Contents_64-win\EQUZX.vst3`); on macOS it is
+(`EQUZX.vst3\Contents\x86_64-win\EQUZX.vst3`); on macOS it is
 `EQUZX.vst3/Contents/MacOS/EQUZX`. CI asserts both layouts on every run.
 
 On Linux the build additionally needs ALSA, JACK and X11 development headers,
@@ -146,6 +146,12 @@ gives flat panels rather than holes.
 
 ## Known limitations
 
+* **HiDPI on Windows depends on the host.** The whole layout is in egui points,
+  so it scales correctly wherever the DPI is known — but the editor only learns
+  it from the host, through VST3's `IPlugViewContentScaleSupport`. A host that
+  never calls it leaves `nih_plug_egui` on its default factor of 1.0 and the
+  interface renders 1:1, which on a 4K display is small. The window can be
+  dragged larger, which gives more room rather than larger text.
 * The standalone wrapper's WASAPI backend needs a period size matching what the
   device hands it, e.g. `--period-size 1056`; otherwise nih-plug's cpal backend
   panics before any audio flows. This is the dev harness, not the plugin.

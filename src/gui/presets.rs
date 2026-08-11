@@ -158,7 +158,26 @@ fn read(path: &Path) -> Option<PresetFile> {
     Some(preset)
 }
 
+/// Longest stem a filename is allowed to carry.
+///
+/// Windows still enforces a 260-character path unless long paths have been
+/// switched on, and the folder this sits in is already sixty or so characters
+/// deep under `%APPDATA%`. A preset with a paragraph for a name should come back
+/// truncated rather than fail to save.
+const MAX_STEM: usize = 64;
+
+/// Device names Windows reserves, which cannot be a filename even with an
+/// extension on the end — `CON.equz.json` is as unopenable as `CON`.
+const RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// A filename that every platform will accept, whatever the preset is called.
+///
+/// Deliberately the same on every platform rather than conditional: a preset
+/// folder should be copyable from a Mac to a PC and still work, and a name that
+/// is legal here but not there is exactly what would break that.
 fn file_name(name: &str) -> String {
     let mut stem: String = name
         .chars()
@@ -170,9 +189,18 @@ fn file_name(name: &str) -> String {
             }
         })
         .collect();
+    // Everything above is ASCII by construction, so truncating by bytes cannot
+    // land inside a character.
+    stem.truncate(MAX_STEM);
+    // After the truncation, so a name that is only trailing space once cut is
+    // still caught.
     stem = stem.trim().to_owned();
+
     if stem.is_empty() {
         stem = "preset".into();
+    }
+    if RESERVED.contains(&stem.to_ascii_uppercase().as_str()) {
+        stem.insert(0, '_');
     }
     format!("{stem}.{EXTENSION}")
 }
@@ -194,11 +222,62 @@ mod tests {
 
     #[test]
     fn a_filename_never_escapes_the_preset_folder() {
-        for hostile in ["../evil", "..\\evil", "/etc/passwd", "a/../../b"] {
+        for hostile in ["../evil", "..\\evil", "/etc/passwd", "a/../../b", "C:\\Windows"] {
             let name = file_name(hostile);
             assert!(!name.contains('/'), "{hostile} produced {name}");
             assert!(!name.contains('\\'), "{hostile} produced {name}");
             assert!(!name.contains(".."), "{hostile} produced {name}");
+            assert!(!name.contains(':'), "{hostile} produced {name}");
+        }
+    }
+
+    /// Windows keeps a handful of names for devices, and refuses them as
+    /// filenames whatever extension is stuck on the end.
+    #[test]
+    fn a_name_windows_has_reserved_is_stepped_around() {
+        assert_eq!(file_name("CON"), "_CON.equz.json");
+        assert_eq!(file_name("nul"), "_nul.equz.json");
+        assert_eq!(file_name("Com1"), "_Com1.equz.json");
+        assert_eq!(file_name("LPT9"), "_LPT9.equz.json");
+        // Only the whole stem is reserved, not a name that merely contains one.
+        assert_eq!(file_name("Console"), "Console.equz.json");
+        assert_eq!(file_name("COM10"), "COM10.equz.json");
+    }
+
+    /// A path over 260 characters is unopenable on a Windows install without
+    /// long paths, and `%APPDATA%` has already spent sixty of them.
+    #[test]
+    fn a_very_long_name_is_truncated_rather_than_left_to_fail() {
+        let name = file_name(&"x".repeat(500));
+        assert_eq!(name.len(), MAX_STEM + 1 + EXTENSION.len());
+        assert!(name.starts_with("xxxx"));
+
+        // Truncation must not leave a trailing space, which Windows also
+        // refuses at the end of a filename component.
+        let name = file_name(&format!("{} tail", "y".repeat(MAX_STEM - 1)));
+        assert!(!name[..name.len() - EXTENSION.len() - 1].ends_with(' '), "{name}");
+    }
+
+    /// Whatever comes out has to be legal on every platform, because a preset
+    /// folder is something people copy between machines.
+    #[test]
+    fn a_filename_holds_no_character_any_platform_rejects() {
+        for hostile in [
+            "a<b>c:d\"e|f?g*h",
+            "trailing.",
+            "trailing ",
+            "\u{0}nul byte",
+            "emoji 🎛 knob",
+        ] {
+            let name = file_name(hostile);
+            assert!(
+                name.chars().all(|c| c.is_ascii_alphanumeric()
+                    || matches!(c, '-' | '_' | ' ' | '.')),
+                "{hostile} produced {name}"
+            );
+            let stem = &name[..name.len() - EXTENSION.len() - 1];
+            assert!(!stem.ends_with(' ') && !stem.ends_with('.'), "{hostile} produced {name}");
+            assert!(!stem.is_empty(), "{hostile} produced {name}");
         }
     }
 
