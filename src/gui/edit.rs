@@ -253,6 +253,11 @@ pub fn apply_snapshot(frame: &Frame, snapshot: &Snapshot) {
     }
 
     set_float(frame.setter, &frame.params.output_gain, snapshot.output_gain);
+    set_bool(
+        frame.setter,
+        &frame.params.phase_invert,
+        snapshot.phase_invert,
+    );
     write_resonance(frame.setter, &frame.params.resonance, &snapshot.resonance);
 
     frame.transient.set_solo(None);

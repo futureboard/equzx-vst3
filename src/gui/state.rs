@@ -17,8 +17,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::params::{
-    BandChannel, BandKind, BandResMode, DynMode, EquzxParams, ResMode, ResQuality,
-    ResonanceParams, Slope, MAX_BANDS,
+    BandChannel, BandKind, BandResMode, DynMode, EquzxParams, ResMode, ResQuality, ResonanceParams,
+    Slope, MAX_BANDS,
 };
 
 // The resonance enums travel as their wire names, like every other enum in a
@@ -333,6 +333,7 @@ impl UiState {
 pub struct Snapshot {
     pub bands: Vec<BandSnapshot>,
     pub output_gain: f32,
+    pub phase_invert: bool,
     pub resonance: ResonanceSnapshot,
 }
 
@@ -346,6 +347,7 @@ impl Snapshot {
         Self {
             bands: read_bands(params).iter().map(BandSnapshot::from).collect(),
             output_gain: params.output_gain.value(),
+            phase_invert: params.phase_invert.value(),
             resonance: ResonanceSnapshot::capture(&params.resonance),
         }
     }
@@ -362,6 +364,7 @@ impl Snapshot {
                 .map(BandSnapshot::sanitized)
                 .collect(),
             output_gain: finite(self.output_gain, 0.0).clamp(-24.0, 12.0),
+            phase_invert: self.phase_invert,
             resonance: self.resonance.sanitized(),
         }
     }

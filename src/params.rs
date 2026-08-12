@@ -519,7 +519,10 @@ impl Default for BandParams {
             res_range: FloatParam::new(
                 "Res Range",
                 36.0,
-                FloatRange::Linear { min: 0.0, max: 36.0 },
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 36.0,
+                },
             )
             .with_smoother(SmoothingStyle::Linear(30.0))
             .with_unit(" dB")
@@ -633,13 +636,20 @@ impl Default for ResonanceParams {
             range: FloatParam::new(
                 "Resonance Range",
                 36.0,
-                FloatRange::Linear { min: 0.0, max: 36.0 },
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 36.0,
+                },
             )
             .with_smoother(SmoothingStyle::Linear(30.0))
             .with_unit(" dB")
             .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
-            depth: FloatParam::new("Resonance Depth", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
+            depth: FloatParam::new(
+                "Resonance Depth",
+                0.5,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
                 .with_smoother(SmoothingStyle::Linear(30.0))
                 .with_unit("%")
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
@@ -721,7 +731,11 @@ impl Default for ResonanceParams {
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(1))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
 
-            mix: FloatParam::new("Resonance Mix", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+            mix: FloatParam::new(
+                "Resonance Mix",
+                1.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
                 .with_smoother(SmoothingStyle::Linear(30.0))
                 .with_unit("%")
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
@@ -748,6 +762,11 @@ pub struct EquzxParams {
     /// the automation index a host already wrote into its sessions.
     #[nested(group = "Resonance")]
     pub resonance: ResonanceParams,
+
+    /// Appended so existing automation indices stay stable. This is a polarity
+    /// flip (180 degrees) at the final output, applied equally to both channels.
+    #[id = "phaseinvert"]
+    pub phase_invert: BoolParam,
 
     /// View state the DAW should remember but never automate: analyser mode,
     /// dB range, panel height, the parked A/B slot. Opaque JSON owned by the UI.
@@ -785,6 +804,7 @@ impl Default for EquzxParams {
 
             bands: std::array::from_fn(|_| BandParams::default()),
             resonance: ResonanceParams::default(),
+            phase_invert: BoolParam::new("Invert Phase", false),
             ui_state: Arc::new(RwLock::new(String::new())),
             editor_state: EguiState::from_size(
                 crate::gui::DEFAULT_WIDTH,

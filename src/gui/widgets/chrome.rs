@@ -58,13 +58,14 @@ pub fn fill_glass(
     let corner = theme::corner(radius.round().clamp(0.0, 255.0) as u8);
 
     // Opaque, and close to what the blur averages out to, so a frame that falls
-    // back to it looks deliberate rather than broken.
+    // back to it looks deliberate rather than broken. Keep this visibly above
+    // the root surface: hosts often provide a darker framebuffer than preview.
     painter.set(
         slot.fill,
         nih_plug_egui::egui::epaint::RectShape::filled(
             rect,
             corner,
-            Color32::from_rgb(0x15, 0x15, 0x19),
+            Color32::from_rgb(0x22, 0x22, 0x29),
         ),
     );
     if let Some(p) = sheen {
@@ -77,7 +78,7 @@ pub fn fill_glass(
         nih_plug_egui::egui::epaint::RectShape::stroke(
             rect,
             corner,
-            Stroke::new(1.0, white(26)),
+            Stroke::new(1.0, white(38)),
             StrokeKind::Inside,
         ),
     );
@@ -89,7 +90,7 @@ pub fn fill_glass(
                 Pos2::new(rect.min.x + radius * 0.6, rect.min.y + 1.0),
                 Pos2::new(rect.max.x - radius * 0.6, rect.min.y + 1.0),
             ],
-            Stroke::new(1.0, white(22)),
+            Stroke::new(1.0, white(34)),
         ),
     );
 }

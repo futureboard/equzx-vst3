@@ -1,7 +1,7 @@
 ; EQUZX — Windows installer (Inno Setup 6)
 ;
 ; Build with:
-;   iscc /DVersion=2026.8.11 /DBundled=..\..\target\bundled installer\windows\equzx.iss
+;   iscc /DVersion=2026.8.12 /DBundled=..\..\target\bundled installer\windows\equzx.iss
 ;
 ; Both formats are directory bundles, not single files: a VST3 on Windows is
 ; EQUZX.vst3\Contents\x86_64-win\EQUZX.vst3, and the outer .vst3 is a folder.

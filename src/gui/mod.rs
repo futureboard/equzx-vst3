@@ -248,7 +248,7 @@ fn layout(ui: &mut Ui, frame: &Frame, app: &mut View, bands: &[state::BandView])
     .intro(0.07)
     .glass(gpu::Glass::panel(0.7))
     .show(ui.ctx(), &fx, |ui| {
-        panels::overlays::analyzer(ui, &mut app.ui, &fx)
+        panels::overlays::analyzer(ui, &mut app.ui, &fx, frame, bands, &mut app.selected)
     });
 
     // --- header -----------------------------------------------------------

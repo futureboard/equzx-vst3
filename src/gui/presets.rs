@@ -26,14 +26,14 @@ use crate::params::{
 
 /// The JSON schema version, kept for the legacy reader. Bumped when the
 /// resonance stage joined the snapshot.
-pub const PRESET_VERSION: u32 = 2;
+pub const PRESET_VERSION: u32 = 3;
 
 /// `FBPF` — Futureboard Preset File.
 const MAGIC: &[u8; 4] = b"FBPF";
 /// Bumped only for changes the reader below could not skip over. Version 2
 /// added the resonance mode/quality/range and the per-band resonance fields;
 /// version 1 files still load, with those fields on their defaults.
-const PST_VERSION: u16 = 2;
+const PST_VERSION: u16 = 3;
 
 const EXTENSION: &str = "pst";
 const LEGACY_EXTENSION: &str = "equz.json";
@@ -59,6 +59,7 @@ struct PresetFile {
 /// u16                   name length in bytes
 /// [u8]                  name, UTF-8
 /// f32                   output gain, dB
+/// u8  (v3)              output polarity inverted (0/1)
 /// u8                    resonance enabled (0/1)
 /// f32 × 8               resonance: depth, sharpness, threshold, attack,
 ///                       release, low, high, mix
@@ -89,6 +90,7 @@ fn encode(preset: &PresetFile) -> Vec<u8> {
     out.extend_from_slice(&name[..name_len]);
 
     out.extend_from_slice(&preset.snapshot.output_gain.to_le_bytes());
+    out.push(preset.snapshot.phase_invert as u8);
 
     let r = &preset.snapshot.resonance;
     out.push(r.enabled as u8);
@@ -135,9 +137,11 @@ fn encode(preset: &PresetFile) -> Vec<u8> {
             BandChannel::Right => 4,
         });
         out.push(band.slope.db_per_oct() as u8);
-        out.push(band.enabled as u8
+        out.push(
+            band.enabled as u8
             | (band.dynamic as u8) << 1
-            | ((band.dyn_mode == DynMode::Below) as u8) << 2);
+                | ((band.dyn_mode == DynMode::Below) as u8) << 2,
+        );
         for v in [
             band.freq,
             band.gain,
@@ -183,6 +187,7 @@ fn decode(bytes: &[u8]) -> Option<PresetFile> {
     let name = String::from_utf8(cur.take(name_len)?.to_vec()).ok()?;
 
     let output_gain = cur.f32()?;
+    let phase_invert = version >= 3 && cur.take(1)?[0] != 0;
     let mut resonance = ResonanceSnapshot {
         enabled: cur.take(1)?[0] != 0,
         depth: cur.f32()?,
@@ -227,8 +232,7 @@ fn decode(bytes: &[u8]) -> Option<PresetFile> {
             4 => BandChannel::Right,
             _ => BandChannel::Stereo,
         };
-        let slope =
-            Slope::from_db_per_oct(cur.take(1)?[0] as u32).unwrap_or(Slope::S24);
+        let slope = Slope::from_db_per_oct(cur.take(1)?[0] as u32).unwrap_or(Slope::S24);
         let flags = cur.take(1)?[0];
         let mut band = BandSnapshot {
             kind,
@@ -272,6 +276,7 @@ fn decode(bytes: &[u8]) -> Option<PresetFile> {
         snapshot: Snapshot {
             bands,
             output_gain,
+            phase_invert,
             resonance,
         },
     })
@@ -502,7 +507,13 @@ mod tests {
 
     #[test]
     fn a_filename_never_escapes_the_preset_folder() {
-        for hostile in ["../evil", "..\\evil", "/etc/passwd", "a/../../b", "C:\\Windows"] {
+        for hostile in [
+            "../evil",
+            "..\\evil",
+            "/etc/passwd",
+            "a/../../b",
+            "C:\\Windows",
+        ] {
             let name = file_name(hostile);
             assert!(!name.contains('/'), "{hostile} produced {name}");
             assert!(!name.contains('\\'), "{hostile} produced {name}");
@@ -535,7 +546,10 @@ mod tests {
         // Truncation must not leave a trailing space, which Windows also
         // refuses at the end of a filename component.
         let name = file_name(&format!("{} tail", "y".repeat(MAX_STEM - 1)));
-        assert!(!name[..name.len() - EXTENSION.len() - 1].ends_with(' '), "{name}");
+        assert!(
+            !name[..name.len() - EXTENSION.len() - 1].ends_with(' '),
+            "{name}"
+        );
     }
 
     /// Whatever comes out has to be legal on every platform, because a preset
@@ -551,12 +565,15 @@ mod tests {
         ] {
             let name = file_name(hostile);
             assert!(
-                name.chars().all(|c| c.is_ascii_alphanumeric()
-                    || matches!(c, '-' | '_' | ' ' | '.')),
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ' | '.')),
                 "{hostile} produced {name}"
             );
             let stem = &name[..name.len() - EXTENSION.len() - 1];
-            assert!(!stem.ends_with(' ') && !stem.ends_with('.'), "{hostile} produced {name}");
+            assert!(
+                !stem.ends_with(' ') && !stem.ends_with('.'),
+                "{hostile} produced {name}"
+            );
             assert!(!stem.is_empty(), "{hostile} produced {name}");
         }
     }
@@ -570,6 +587,7 @@ mod tests {
 
         let snapshot = Snapshot {
             output_gain: -2.25,
+            phase_invert: true,
             bands: vec![
                 BandSnapshot {
                     kind: BandKind::HighCut,

@@ -174,7 +174,9 @@ impl<'a> Knob<'a> {
         }
 
         let norm = self.to_norm(changed.unwrap_or(self.value));
-        let alpha = if self.disabled { 0.3 } else { 1.0 };
+        // Disabled controls stay readable while their muted accent still
+        // communicates that they cannot currently be edited.
+        let alpha = if self.disabled { 0.46 } else { 1.0 };
         paint_dial(ui, dial_rect, norm, &self, alpha, &response);
 
         let text = (self.format)(changed.unwrap_or(self.value));
@@ -200,8 +202,22 @@ fn paint_dial(
     let pointer = size * 0.208;
     let width = (size * 0.0625).max(2.0);
 
-    // Track.
-    painter.add(arc(center, radius, 0.0, 1.0, width, dim(white(26), alpha)));
+    // A small glass hub with its own shadow and reflected catch keeps the dial
+    // distinct from every panel depth, including inside dark DAW hosts.
+    painter.circle_filled(
+        center + vec2(0.0, size * 0.035),
+        hub * 1.16,
+        dim(Color32::from_black_alpha(150), alpha),
+    );
+    painter.circle(
+        center,
+        hub * 1.12,
+        dim(Color32::from_rgb(0x2b, 0x2b, 0x33), alpha),
+        Stroke::new(1.0, dim(white(42), alpha)),
+    );
+
+    // The control scale needs to read without requiring hover.
+    painter.add(arc(center, radius, 0.0, 1.0, width, dim(white(54), alpha)));
 
     // Bipolar parameters fill outward from centre; everything else from the left.
     let bipolar = knob.min < 0.0 && knob.max > 0.0 && !knob.log;
@@ -221,10 +237,15 @@ fn paint_dial(
         center,
         hub,
         dim(SURFACE_HUB, alpha),
-        Stroke::new(1.0, dim(white(20), alpha)),
+        Stroke::new(1.0, dim(white(58), alpha)),
+    );
+    painter.circle_filled(
+        center + vec2(-hub * 0.28, -hub * 0.32),
+        (size * 0.026).max(1.1),
+        dim(white(72), alpha),
     );
     if response.hovered() && !knob.disabled {
-        painter.circle_stroke(center, hub, Stroke::new(1.0, dim(knob.color, 0.35)));
+        painter.circle_stroke(center, hub * 1.12, Stroke::new(1.0, dim(knob.color, 0.55)));
     }
 
     let angle = (START + norm * ARC).to_radians();

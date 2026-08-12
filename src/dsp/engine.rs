@@ -125,6 +125,7 @@ pub struct Settings {
     pub bands: [BandPlan; MAX_BANDS],
     pub output_gain_db: f32,
     pub bypass: bool,
+    pub phase_invert: bool,
     pub solo: Option<usize>,
     pub resonance: ResonanceSettings,
     /// Which engine the global resonance switch arms.
@@ -139,6 +140,7 @@ impl Default for Settings {
             bands: [BandPlan::default(); MAX_BANDS],
             output_gain_db: 0.0,
             bypass: false,
+            phase_invert: false,
             solo: None,
             resonance: ResonanceSettings::default(),
             res_mode: ResMode::Adaptive,
@@ -165,6 +167,7 @@ pub fn settings_for_block(
         bands: [BandPlan::default(); MAX_BANDS],
         output_gain_db: params.output_gain.smoothed.next_step(steps),
         bypass: params.bypass.value(),
+        phase_invert: params.phase_invert.value(),
         solo: transient.solo(),
         resonance: ResonanceSettings {
             enabled: res.enabled.value(),
@@ -480,6 +483,9 @@ pub struct EqEngine {
     /// Where the delta monitor stands, 0..1. The parameter is a switch; this
     /// eases toward it so flipping the monitor is a fade, not a click.
     delta_mix: f32,
+    /// Smoothed output polarity. A hard +1/-1 switch can click anywhere except
+    /// a zero crossing, so the button moves through zero over a few ms.
+    phase_gain: f32,
 }
 
 /// Fade between the stage's normal output (dry crossfaded toward wet by
@@ -553,6 +559,7 @@ impl EqEngine {
             res_dry_l: [0.0; CONTROL_BLOCK],
             res_dry_r: [0.0; CONTROL_BLOCK],
             delta_mix: 0.0,
+            phase_gain: 1.0,
         }
     }
 
@@ -648,6 +655,7 @@ impl EqEngine {
             if self.pool.busy() {
                 self.pool.reset();
             }
+            self.phase_gain = 1.0;
             return;
         }
 
@@ -942,12 +950,18 @@ impl EqEngine {
         }
 
         let out_gain = 10f32.powf(s.output_gain_db / 20.0);
-        for x in left[..n].iter_mut() {
-            *x *= out_gain;
-        }
+        let phase_target = if s.phase_invert { -1.0 } else { 1.0 };
+        let phase_step = 2.0 / (self.sr * 0.005).max(1.0);
+        for i in 0..n {
+            self.phase_gain = if self.phase_gain < phase_target {
+                (self.phase_gain + phase_step).min(phase_target)
+            } else {
+                (self.phase_gain - phase_step).max(phase_target)
+            };
+            let gain = out_gain * self.phase_gain;
+            left[i] *= gain;
         if let Some(r) = right.as_deref_mut() {
-            for x in r[..n].iter_mut() {
-                *x *= out_gain;
+                r[i] *= gain;
             }
         }
 
@@ -1211,6 +1225,27 @@ mod tests {
         };
         let out = rms_db(&mut engine, &s, 1000.0, true);
         assert!((out - (SINE_RMS_DB - 6.0)).abs() < 0.02, "got {out} dB");
+    }
+
+    #[test]
+    fn phase_invert_reverses_both_channels_without_changing_level() {
+        let mut engine = EqEngine::new(SR);
+        let s = Settings {
+            phase_invert: true,
+            ..Settings::default()
+        };
+        let mut l = [0.25; CONTROL_BLOCK];
+        let mut r = [-0.5; CONTROL_BLOCK];
+
+        // Let the click-safe polarity ramp reach its destination.
+        for _ in 0..12 {
+            l.fill(0.25);
+            r.fill(-0.5);
+            engine.process_block(&mut l, Some(&mut r), &s);
+        }
+
+        assert!((l[CONTROL_BLOCK - 1] + 0.25).abs() < 1e-6);
+        assert!((r[CONTROL_BLOCK - 1] - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -2425,10 +2460,7 @@ mod tests {
         // Window (43 ms) + confidence build + attack: comfortably under a
         // quarter second, and it must not be instant either — instant would
         // mean the hysteresis was bypassed.
-        assert!(
-            (30.0..250.0).contains(&ms),
-            "reaction time was {ms} ms"
-        );
+        assert!((30.0..250.0).contains(&ms), "reaction time was {ms} ms");
     }
 
     /// Flipping the delta monitor mid-cut must fade, not click: no sample
@@ -2574,7 +2606,8 @@ mod tests {
             for block in 0..blocks {
                 for i in 0..CONTROL_BLOCK {
                     let t = (block * CONTROL_BLOCK + i) as f32 / SR;
-                    let x = (2.0 * PI * 220.0 * t).sin() * 0.4 + (2.0 * PI * 3130.0 * t).sin() * 0.2;
+                    let x =
+                        (2.0 * PI * 220.0 * t).sin() * 0.4 + (2.0 * PI * 3130.0 * t).sin() * 0.2;
                     l[i] = x;
                     r[i] = x * 0.8;
                 }

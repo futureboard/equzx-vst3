@@ -13,7 +13,7 @@ use nih_plug_egui::egui::{
 use crate::gui::edit::{self, Frame, SLOPES};
 use crate::gui::gpu::FxRenderer;
 use crate::gui::state::{BandView, PANEL_MIN};
-use crate::gui::theme::{self, band_color, fade, white, MOCHI, NEON};
+use crate::gui::theme::{self, band_color, fade, white, NEON};
 use crate::gui::widgets::chrome::{self, Fill};
 use crate::gui::widgets::glyph;
 use crate::gui::widgets::Knob;
@@ -170,7 +170,7 @@ pub fn show(
         Some(index) => {
             let band = bands[index];
             let color = band_color(index);
-            filter_row(&mut editor, frame, &band, color, selected);
+            filter_row(&mut editor, frame, &band, color);
             dynamics_row(&mut editor, frame, &band, color);
         }
     }
@@ -302,14 +302,15 @@ fn filter_row(
     frame: &Frame,
     band: &BandView,
     color: Color32,
-    selected: &mut Option<usize>,
 ) {
     ui.horizontal(|ui| {
         // `gap-4` between the row's groups in the original.
         ui.spacing_mut().item_spacing.x = 16.0;
 
         // --- filter shape ------------------------------------------------
-        ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for (kind, label) in KINDS.iter().zip(KIND_LABELS) {
                 let on = band.kind == *kind;
@@ -333,6 +334,44 @@ fn filter_row(
                     edit::set_kind(frame, band.slot, *kind);
                 }
                 response.on_hover_text(label);
+            }
+            });
+
+            let is_cut = band.kind.is_cut();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                chrome::caption(ui, "Slope");
+                ui.label(
+                    nih_plug_egui::egui::RichText::new("dB / oct")
+                        .font(theme::caption())
+                        .color(white(if is_cut { 64 } else { 32 })),
+                );
+            });
+            let current = SLOPES
+                .iter()
+                .position(|slope| *slope == band.slope)
+                .unwrap_or(1);
+            let control = ui.scope(|ui| {
+                if !is_cut {
+                    ui.disable();
+                    ui.set_opacity(0.38);
+                }
+                if let Some(index) = chrome::segmented(
+                    ui,
+                    &["12", "24", "36", "48", "72", "96"],
+                    current,
+                    color,
+                    29.0,
+                    25.0,
+                    FontId::proportional(theme::TINY),
+                ) {
+                    edit::set_slope(frame, band.slot, SLOPES[index]);
+                }
+            });
+            if !is_cut {
+                control.response.on_hover_text(
+                    "Slope is available for low-cut and high-cut filters",
+                );
             }
         });
 
@@ -382,40 +421,6 @@ fn filter_row(
         }
         res_menu(ui, frame, band, color);
 
-        // --- slope --------------------------------------------------------
-        let is_cut = band.kind.is_cut();
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            chrome::caption(ui, "Slope");
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                for slope in SLOPES {
-                    let on = band.slope == slope;
-                    let response = chrome::pill_compact(
-                        ui,
-                        &format!("{}", slope.db_per_oct()),
-                        if !is_cut {
-                            Fill::None
-                        } else if on {
-                            Fill::Solid(color)
-                        } else {
-                            Fill::Quiet
-                        },
-                        Some(28.0),
-                        23.0,
-                    );
-                    if response.clicked() && is_cut {
-                        edit::set_slope(frame, band.slot, slope);
-                    }
-                }
-            });
-            ui.label(
-                nih_plug_egui::egui::RichText::new("dB / oct")
-                    .font(theme::caption())
-                    .color(white(if is_cut { 64 } else { 26 })),
-            );
-        });
-
         // --- channel ------------------------------------------------------
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 4.0;
@@ -443,35 +448,6 @@ fn filter_row(
             );
         });
 
-        // --- on / solo / delete, pinned right ------------------------------
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = 6.0;
-            if chrome::pill_upper(ui, "Del", Fill::Quiet).clicked() {
-                edit::remove_band(frame, band.slot);
-                *selected = None;
-            }
-            let soloed = frame.transient.solo() == Some(band.slot);
-            let solo = chrome::pill_upper(
-                ui,
-                "Solo",
-                if soloed { Fill::Solid(MOCHI) } else { Fill::Quiet },
-            );
-            if solo.clicked() {
-                frame
-                    .transient
-                    .set_solo(if soloed { None } else { Some(band.slot) });
-            }
-            solo.on_hover_text("Solo this band — or right-drag its handle on the display");
-            if chrome::pill_upper(
-                ui,
-                if band.enabled { "On" } else { "Off" },
-                if band.enabled { Fill::Lit } else { Fill::Quiet },
-            )
-            .clicked()
-            {
-                edit::set_enabled(frame, band.slot, !band.enabled);
-            }
-        });
     });
 }
 

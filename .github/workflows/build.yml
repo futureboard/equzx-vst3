@@ -50,7 +50,17 @@ jobs:
       - name: Read version
         id: version
         shell: bash
-        run: echo "version=$(python3 -c 'import json; print(json.load(open("version.json"))["version"])')" >> "$GITHUB_OUTPUT"
+        run: node -p "'version=' + require('./version.json').version" >> "$GITHUB_OUTPUT"
+
+      - name: Check Cargo and release versions agree
+        shell: bash
+        run: |
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).packages.find(p=>p.name==='equzx').version))")"
+          declared="${{ steps.version.outputs.version }}"
+          test "$cargo_version" = "$declared" || {
+            echo "Cargo.toml ($cargo_version) does not match version.json ($declared)"
+            exit 1
+          }
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -133,7 +143,7 @@ jobs:
 
       - name: Read version
         id: version
-        run: echo "version=$(python3 -c 'import json; print(json.load(open("version.json"))["version"])')" >> "$GITHUB_OUTPUT"
+        run: node -p "'version=' + require('./version.json').version" >> "$GITHUB_OUTPUT"
 
       - name: Refuse to publish a tag that disagrees with version.json
         run: |
@@ -157,6 +167,8 @@ jobs:
         with:
           files: installers/*
           generate_release_notes: true
+          draft: true
+          fail_on_unmatched_files: true
           body: |
             **EQUZX ${{ steps.version.outputs.version }}** — VST3 and CLAP.
 

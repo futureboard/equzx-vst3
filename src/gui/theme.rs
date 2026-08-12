@@ -17,9 +17,9 @@ pub const NEON: Color32 = Color32::from_rgb(0xff, 0x4d, 0x9d);
 pub const MOCHI: Color32 = Color32::from_rgb(0xff, 0xd3, 0xe4);
 
 /// Neutral surfaces. Hue-free on purpose, so the pink is the only colour.
-pub const SURFACE_DEEP: Color32 = Color32::from_rgb(0x0b, 0x0b, 0x0d);
-pub const SURFACE_HUB: Color32 = Color32::from_rgb(0x17, 0x17, 0x1a);
-pub const SURFACE_ROOT: Color32 = Color32::from_rgb(0x07, 0x07, 0x08);
+pub const SURFACE_DEEP: Color32 = Color32::from_rgb(0x10, 0x10, 0x14);
+pub const SURFACE_HUB: Color32 = Color32::from_rgb(0x25, 0x25, 0x2c);
+pub const SURFACE_ROOT: Color32 = Color32::from_rgb(0x09, 0x09, 0x0c);
 /// Top and bottom of the field the plot sits on.
 pub const PLOT_TOP: Color32 = Color32::from_rgb(0x0a, 0x0a, 0x0b);
 pub const PLOT_BOTTOM: Color32 = Color32::from_rgb(0x12, 0x12, 0x14);
@@ -186,7 +186,7 @@ pub fn apply(ctx: &nih_plug_egui::egui::Context) {
 
     let mut visuals = Visuals::dark();
     visuals.panel_fill = SURFACE_ROOT;
-    visuals.window_fill = Color32::from_rgb(0x13, 0x13, 0x15);
+    visuals.window_fill = Color32::from_rgb(0x1c, 0x1c, 0x22);
     visuals.extreme_bg_color = Color32::from_rgb(0x05, 0x05, 0x06);
     visuals.override_text_color = Some(white(230));
     visuals.window_corner_radius = corner(R_MENU);
