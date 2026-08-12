@@ -38,13 +38,21 @@
 //! the plain enums: it is driven by a [`Settings`] snapshot, which
 //! [`settings_for_block`] builds once per block from the parameters.
 
+use std::sync::Arc;
+
 use crate::dsp::biquad::{butterworth_qs, Biquad, Coeffs, MAX_SECTIONS};
 use crate::dsp::dynamics::{dynamic_step, step_toward, DynSettings, LevelDetector};
 use crate::dsp::resonance::{
-    band_freq, band_region_weight, ResonanceBank, ResonanceSettings, RES_BANDS,
+    band_freq, band_region_weight, crossfade, BandOverlays, ResonanceBank, ResonanceSettings,
+    RES_BANDS,
+};
+use crate::dsp::spectral::{
+    AdaptivePool, BandCtl, BandRegionView, ConfigView, PoolControls, PoolTuning, SharedSpectral,
+    TargetView, MAX_TARGETS,
 };
 use crate::params::{
-    BandChannel, BandKind, Domain, DynMode, EquzxParams, TransientState, MAX_BANDS,
+    BandChannel, BandKind, BandResMode, Domain, DynMode, EquzxParams, ResMode, ResQuality,
+    TransientState, MAX_BANDS,
 };
 
 /// Samples between coefficient updates. A power of two, and small enough that a
@@ -71,6 +79,17 @@ pub struct BandPlan {
     pub release: f32,
     /// Adaptive resonance suppression inside this band's own region, 0..1.
     pub resonance: f32,
+    /// How that amount finds its resonances — see [`BandResMode`].
+    pub res_mode: BandResMode,
+    /// Ceiling on this band's cut, in dB.
+    pub res_range: f32,
+    /// dB taken off the detection threshold inside this band's region.
+    pub res_sens: f32,
+    /// Half-width of the spectral search region, octaves either side.
+    pub res_width: f32,
+    /// Ballistics for this band's resonance attenuation.
+    pub res_attack: f32,
+    pub res_release: f32,
 }
 
 impl Default for BandPlan {
@@ -90,6 +109,12 @@ impl Default for BandPlan {
             attack: 20.0,
             release: 200.0,
             resonance: 0.0,
+            res_mode: BandResMode::Adaptive,
+            res_range: 36.0,
+            res_sens: 0.0,
+            res_width: 1.0,
+            res_attack: 5.0,
+            res_release: 40.0,
         }
     }
 }
@@ -102,6 +127,10 @@ pub struct Settings {
     pub bypass: bool,
     pub solo: Option<usize>,
     pub resonance: ResonanceSettings,
+    /// Which engine the global resonance switch arms.
+    pub res_mode: ResMode,
+    /// Adaptive filter budget for the spectral engine.
+    pub res_quality: ResQuality,
 }
 
 impl Default for Settings {
@@ -112,6 +141,8 @@ impl Default for Settings {
             bypass: false,
             solo: None,
             resonance: ResonanceSettings::default(),
+            res_mode: ResMode::Adaptive,
+            res_quality: ResQuality::Ultra,
         }
     }
 }
@@ -144,9 +175,12 @@ pub fn settings_for_block(
             release_ms: res.release.value(),
             low_hz: res.low.smoothed.next_step(steps),
             high_hz: res.high.smoothed.next_step(steps),
+            range_db: res.range.smoothed.next_step(steps),
             mix: res.mix.smoothed.next_step(steps),
             delta: res.delta.value(),
         },
+        res_mode: res.mode.value(),
+        res_quality: res.quality.value(),
     };
 
     for (plan, p) in settings.bands.iter_mut().zip(params.bands.iter()) {
@@ -156,6 +190,9 @@ pub fn settings_for_block(
         let dyn_range = p.dyn_range.smoothed.next_step(steps);
         let threshold = p.threshold.smoothed.next_step(steps);
         let resonance = p.resonance.smoothed.next_step(steps);
+        let res_range = p.res_range.smoothed.next_step(steps);
+        let res_sens = p.res_sens.smoothed.next_step(steps);
+        let res_width = p.res_width.smoothed.next_step(steps);
         let kind = p.kind.value();
 
         *plan = BandPlan {
@@ -175,6 +212,12 @@ pub fn settings_for_block(
             attack: p.attack.value(),
             release: p.release.value(),
             resonance,
+            res_mode: p.res_mode.value(),
+            res_range,
+            res_sens,
+            res_width,
+            res_attack: p.res_attack.value(),
+            res_release: p.res_release.value(),
         };
     }
 
@@ -411,7 +454,12 @@ pub struct EqEngine {
     resonance: Box<ResonanceBank>,
     /// Suppression the EQ's own bands are asking for, per bank band. Rebuilt
     /// each block and owned here so `process_block` never allocates.
-    res_band_depth: Box<[f32; RES_BANDS]>,
+    overlays: Box<BandOverlays>,
+    /// The spectral engine's audio half: the preallocated adaptive filters.
+    pool: Box<AdaptivePool>,
+    /// What the audio thread shares with the spectral worker — the analysis
+    /// ring it feeds, the config it publishes, the targets it reads back.
+    shared: Arc<SharedSpectral>,
     /// Solo listens through the band's own region, applied after the decode.
     solo_coeffs: Coeffs,
     solo_key: CoeffKey,
@@ -425,6 +473,28 @@ pub struct EqEngine {
     /// What the band about to be metered is listening to, one buffer per bus.
     sc_a: [f32; CONTROL_BLOCK],
     sc_b: [f32; CONTROL_BLOCK],
+    /// The signal as it entered the resonance stage, for the stage-wide
+    /// mix/delta blend across both suppression engines.
+    res_dry_l: [f32; CONTROL_BLOCK],
+    res_dry_r: [f32; CONTROL_BLOCK],
+    /// Where the delta monitor stands, 0..1. The parameter is a switch; this
+    /// eases toward it so flipping the monitor is a fade, not a click.
+    delta_mix: f32,
+}
+
+/// Fade between the stage's normal output (dry crossfaded toward wet by
+/// `mix`) and its delta monitor (what was removed), by `d`.
+///
+/// At `d = 1` this is exactly `dry - wet` — the same identity the bank's delta
+/// always satisfied — and at `d = 0` exactly the mix blend, so the eased
+/// switch lands on both endpoints bit-for-bit apart from float rounding.
+#[inline]
+fn blend_delta(wet: &mut [f32], dry: &[f32], mix: f32, d: f32) {
+    for (out, dry) in wet.iter_mut().zip(dry) {
+        let kept = dry + (*out - dry) * mix;
+        let removed = dry - *out;
+        *out = kept + (removed - kept) * d;
+    }
 }
 
 /// Move a stereo pair between the two domains, in place.
@@ -460,11 +530,18 @@ impl Default for EqEngine {
 
 impl EqEngine {
     pub fn new(sr: f32) -> Self {
+        let shared = Arc::new(SharedSpectral::default());
+        shared.cfg.publish(&ConfigView {
+            sample_rate: sr,
+            ..ConfigView::default()
+        });
         Self {
             sr,
             bands: Box::new(std::array::from_fn(|_| BandRuntime::default())),
             resonance: Box::new(ResonanceBank::new(sr)),
-            res_band_depth: Box::new([0.0; RES_BANDS]),
+            overlays: Box::new(BandOverlays::none()),
+            pool: Box::new(AdaptivePool::new(sr)),
+            shared,
             solo_coeffs: Coeffs::identity(),
             solo_key: CoeffKey::NONE,
             solo_l: Biquad::new(),
@@ -473,7 +550,23 @@ impl EqEngine {
             pre_r: [0.0; CONTROL_BLOCK],
             sc_a: [0.0; CONTROL_BLOCK],
             sc_b: [0.0; CONTROL_BLOCK],
+            res_dry_l: [0.0; CONTROL_BLOCK],
+            res_dry_r: [0.0; CONTROL_BLOCK],
+            delta_mix: 0.0,
         }
+    }
+
+    /// The channel the spectral worker communicates over. Hand a clone to
+    /// [`crate::dsp::spectral::SpectralWorker::spawn`]; the engine keeps
+    /// feeding it either way.
+    pub fn spectral_shared(&self) -> Arc<SharedSpectral> {
+        self.shared.clone()
+    }
+
+    /// Snapshot of the adaptive pool for the UI. `out` should hold
+    /// [`MAX_TARGETS`] entries.
+    pub fn spectral_view(&self, out: &mut [TargetView]) {
+        self.pool.view(out);
     }
 
     pub fn sample_rate(&self) -> f32 {
@@ -491,6 +584,7 @@ impl EqEngine {
             self.solo_key = CoeffKey::NONE;
         }
         self.resonance.set_sample_rate(sr);
+        self.pool.set_sample_rate(sr);
         self.reset();
     }
 
@@ -499,6 +593,7 @@ impl EqEngine {
             band.reset();
         }
         self.resonance.reset();
+        self.pool.reset();
         self.solo_l.reset();
         self.solo_r.reset();
         self.solo_key = CoeffKey::NONE;
@@ -517,9 +612,10 @@ impl EqEngine {
         self.resonance.reduction(out);
     }
 
-    /// The deepest cut the resonance stage is making anywhere, in dB.
+    /// The deepest cut the resonance stage is making anywhere — either
+    /// engine's, in dB.
     pub fn resonance_peak(&self) -> f32 {
-        self.resonance.peak_reduction()
+        self.resonance.peak_reduction().max(self.pool.peak_cut())
     }
 
     /// Process one control block in place.
@@ -548,6 +644,9 @@ impl EqEngine {
             }
             if self.resonance.peak_reduction() != 0.0 {
                 self.resonance.reset();
+            }
+            if self.pool.busy() {
+                self.pool.reset();
             }
             return;
         }
@@ -733,16 +832,113 @@ impl EqEngine {
         // as it will be heard — including whatever the bands just did to it.
         // Soloing is a way of hearing one band plainly, so a suppressor chewing
         // on the thing being listened for would defeat the point.
-        if s.solo.is_none() {
+        //
+        // Two engines share the stage. The Adaptive one is the sixth-octave
+        // bank; the Spectral one is the adaptive filter pool fed by the
+        // background FFT worker. Both run in the time domain; both sit under
+        // one stage-wide mix/delta blend, so "listen to what's removed" plays
+        // the combined removal whichever engine made it.
+        let spectral_global = s.resonance.enabled && s.res_mode == ResMode::Spectral;
+        let adaptive_global = s.resonance.enabled && s.res_mode == ResMode::Adaptive;
+        let mut any_band_adaptive = false;
+        let mut any_band_spectral = false;
+        for p in s.bands.iter() {
+            if !p.running || p.resonance <= 0.0 {
+                continue;
+            }
+            match p.res_mode {
+                BandResMode::Adaptive => any_band_adaptive = true,
+                BandResMode::Spectral => any_band_spectral = true,
+                BandResMode::Off => {}
+            }
+        }
+        let spectral_on = spectral_global || any_band_spectral;
+        let bank_on = adaptive_global || any_band_adaptive;
+
+        // The worker's marching orders go out every block — including "stand
+        // down", which is what lets it idle and the pool drain when the last
+        // spectral consumer is switched off.
+        self.publish_spectral_config(s, spectral_global, any_band_spectral);
+
+        // The detector listens to the signal as it enters the stage: after the
+        // EQ bands (it should judge what will be heard) but before suppression
+        // (or each filter would chase its own cut, let go, and grab again).
+        if spectral_on {
+            match right.as_deref() {
+                Some(r) => {
+                    for i in 0..n {
+                        self.shared.ring.push(left[i], r[i]);
+                    }
+                }
+                None => {
+                    for &x in left[..n].iter() {
+                        self.shared.ring.push(x, x);
+                    }
+                }
+            }
+        }
+
+        if s.solo.is_none() && (bank_on || spectral_on || self.pool.busy()) {
+            self.res_dry_l[..n].copy_from_slice(&left[..n]);
+            match right.as_deref() {
+                Some(r) => self.res_dry_r[..n].copy_from_slice(&r[..n]),
+                None => self.res_dry_r[..n].copy_from_slice(&left[..n]),
+            }
+
+            // The bank gets the stage settings with the blend neutralised —
+            // the blend belongs to the stage, not to either engine, and the
+            // bank's global side only runs in Adaptive mode.
             self.plan_band_resonance(s);
+            let bank_settings = ResonanceSettings {
+                enabled: adaptive_global,
+                mix: 1.0,
+                delta: false,
+                ..s.resonance
+            };
             self.resonance.process(
                 &mut left[..n],
                 right.as_deref_mut().map(|r| &mut r[..n]),
-                &s.resonance,
-                &self.res_band_depth[..],
+                &bank_settings,
+                &self.overlays,
             );
-        } else if self.resonance.peak_reduction() != 0.0 {
-            self.resonance.reset();
+
+            let ctl = self.pool_controls(s, spectral_global);
+            self.pool.update(&self.shared.frames, &ctl, dt);
+            self.pool
+                .process(&mut left[..n], right.as_deref_mut().map(|r| &mut r[..n]), n);
+
+            // Stage-wide blend: delta hands back what both engines removed.
+            // The switch itself is eased over a few milliseconds — flipping a
+            // monitor is a listening action, and it must not click.
+            self.delta_mix = step_toward(
+                self.delta_mix,
+                if s.resonance.delta { 1.0 } else { 0.0 },
+                8.0,
+                dt,
+            );
+            let d = self.delta_mix;
+            let mix = s.resonance.mix.clamp(0.0, 1.0);
+            if d > 0.0001 {
+                blend_delta(&mut left[..n], &self.res_dry_l[..n], mix, d);
+                if let Some(r) = right.as_deref_mut() {
+                    blend_delta(&mut r[..n], &self.res_dry_r[..n], mix, d);
+                }
+            } else if mix < 1.0 {
+                crossfade(&mut left[..n], &self.res_dry_l[..n], mix);
+                if let Some(r) = right.as_deref_mut() {
+                    crossfade(&mut r[..n], &self.res_dry_r[..n], mix);
+                }
+            }
+        } else {
+            // Soloed, or nothing left for the stage to do. State describing
+            // whatever was playing before would come back as a burst of stale
+            // suppression, so it is dropped rather than kept warm.
+            if self.resonance.peak_reduction() != 0.0 {
+                self.resonance.reset();
+            }
+            if self.pool.busy() {
+                self.pool.reset();
+            }
         }
 
         let out_gain = 10f32.powf(s.output_gain_db / 20.0);
@@ -771,26 +967,110 @@ impl EqEngine {
     /// what reaches the bank is the amount shaped by that region — see
     /// [`band_region_weight`]. Overlapping bands add, because two bands pointed
     /// at the same spot both wanting it gone is not a reason to want it gone
-    /// less; the sum is capped by the bank.
+    /// less; the sum is capped by the bank. Range, sensitivity and ballistics
+    /// travel alongside, blended by each band's share of the depth.
     fn plan_band_resonance(&mut self, s: &Settings) {
-        let any = s.bands.iter().any(|p| p.running && p.resonance > 0.0);
+        let any = s
+            .bands
+            .iter()
+            .any(|p| p.running && p.resonance > 0.0 && p.res_mode == BandResMode::Adaptive);
         if !any {
             // Nothing to spread, and the bank reads this to decide whether it
             // has any reason to run at all.
-            self.res_band_depth.fill(0.0);
+            self.overlays.clear();
             return;
         }
-        for (i, slot) in self.res_band_depth.iter_mut().enumerate() {
+        let o = &mut self.overlays;
+        for i in 0..RES_BANDS {
             let freq = band_freq(i);
-            let mut depth = 0.0;
+            let mut depth = 0.0f32;
+            let mut cap = 0.0f32;
+            let mut sens = 0.0f32;
+            let mut attack = 0.0f32;
+            let mut release = 0.0f32;
             for p in s.bands.iter() {
-                if !p.running || p.resonance <= 0.0 {
+                if !p.running || p.resonance <= 0.0 || p.res_mode != BandResMode::Adaptive {
                     continue;
                 }
-                depth += p.resonance * band_region_weight(p.kind, p.freq, p.q, freq);
+                let w = p.resonance * band_region_weight(p.kind, p.freq, p.q, freq);
+                if w <= 0.0 {
+                    continue;
+                }
+                depth += w;
+                cap = cap.max(p.res_range);
+                sens += w * p.res_sens;
+                attack += w * p.res_attack;
+                release += w * p.res_release;
             }
-            *slot = depth;
+            o.depth[i] = depth;
+            o.cap_db[i] = cap;
+            if depth > 0.0 {
+                o.sens_db[i] = sens / depth;
+                o.attack_ms[i] = attack / depth;
+                o.release_ms[i] = release / depth;
+            } else {
+                o.sens_db[i] = 0.0;
+                o.attack_ms[i] = 0.0;
+                o.release_ms[i] = 0.0;
+            }
         }
+    }
+
+    /// The spectral worker's marching orders for this block: which regions to
+    /// search, on which channels, how eagerly. Plain relaxed stores.
+    fn publish_spectral_config(&self, s: &Settings, global_on: bool, any_band: bool) {
+        let mut cfg = ConfigView {
+            sample_rate: self.sr,
+            global_on,
+            quality: s.res_quality as u32,
+            threshold_db: s.resonance.threshold_db,
+            selectivity: s.resonance.sharpness,
+            low_hz: s.resonance.low_hz,
+            high_hz: s.resonance.high_hz,
+            bands: [BandRegionView::default(); MAX_BANDS],
+        };
+        if any_band {
+            for (slot, p) in s.bands.iter().enumerate() {
+                if !p.running || p.resonance <= 0.0 || p.res_mode != BandResMode::Spectral {
+                    continue;
+                }
+                cfg.bands[slot] = BandRegionView {
+                    active: true,
+                    channel: p.channel as u8,
+                    freq: p.freq,
+                    width_oct: p.res_width,
+                    sens_db: p.res_sens,
+                };
+            }
+        }
+        self.shared.cfg.publish(&cfg);
+    }
+
+    /// How the pool should treat each target it holds this block.
+    fn pool_controls(&self, s: &Settings, global_on: bool) -> PoolControls {
+        let mut ctl = PoolControls {
+            global_on,
+            amount: s.resonance.depth,
+            range_db: s.resonance.range_db,
+            attack_ms: s.resonance.attack_ms,
+            release_ms: s.resonance.release_ms,
+            max_slots: s.res_quality.max_targets().min(MAX_TARGETS),
+            tuning: PoolTuning::for_quality(s.res_quality),
+            bands: [BandCtl::default(); MAX_BANDS],
+        };
+        for (slot, p) in s.bands.iter().enumerate() {
+            if !p.running || p.res_mode != BandResMode::Spectral {
+                continue;
+            }
+            ctl.bands[slot] = BandCtl {
+                active: p.resonance > 0.0,
+                amount: p.resonance,
+                range_db: p.res_range,
+                attack_ms: p.res_attack,
+                release_ms: p.res_release,
+            };
+        }
+        ctl
     }
 
     fn apply_solo(&mut self, p: BandPlan, left: &mut [f32], right: Option<&mut [f32]>, n: usize) {
@@ -1796,6 +2076,584 @@ mod tests {
                 );
                 assert!(l[i].abs() < 50.0, "block {block} blew up to {}", l[i]);
             }
+        }
+    }
+
+    // --- the spectral engine, end to end ---------------------------------
+
+    use crate::dsp::spectral::{Detector, TargetFrame, TargetView, WireTarget};
+    use crate::params::BandResMode;
+
+    /// Run the engine with the detector driven synchronously — what the worker
+    /// thread does, minus the thread, so the test is deterministic.
+    fn run_spectral(
+        engine: &mut EqEngine,
+        detector: &mut Detector,
+        s: &Settings,
+        freq: f32,
+        blocks: usize,
+    ) -> f32 {
+        let shared = engine.spectral_shared();
+        let mut sum = 0.0f64;
+        let mut counted = 0usize;
+        let mut fed = 0usize;
+        for block in 0..blocks {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            let mut r = [0.0f32; CONTROL_BLOCK];
+            for i in 0..CONTROL_BLOCK {
+                let t = (block * CONTROL_BLOCK + i) as f64 / SR as f64;
+                let x = (2.0 * std::f64::consts::PI * freq as f64 * t).sin() as f32;
+                l[i] = x;
+                r[i] = x;
+            }
+            engine.process_block(&mut l, Some(&mut r), s);
+            fed += CONTROL_BLOCK;
+            if fed >= detector.hop {
+                fed = 0;
+                detector.analyze(&shared);
+            }
+            if block >= blocks / 2 {
+                for x in l {
+                    sum += (x * x) as f64;
+                    counted += 1;
+                }
+            }
+        }
+        20.0 * ((sum / counted as f64).sqrt().max(1e-9) as f32).log10()
+    }
+
+    fn spectral_settings() -> Settings {
+        Settings {
+            resonance: ResonanceSettings {
+                enabled: true,
+                depth: 1.0,
+                threshold_db: 6.0,
+                attack_ms: 2.0,
+                release_ms: 20.0,
+                range_db: 12.0,
+                ..ResonanceSettings::default()
+            },
+            res_mode: ResMode::Spectral,
+            // High: the tests measure the mechanism at the user's Range, so
+            // they run the tier whose safety cap sits above it. Ultra's
+            // conservative live caps get their own assertions.
+            res_quality: crate::params::ResQuality::High,
+            ..Settings::default()
+        }
+    }
+
+    /// Global Spectral mode: the detector finds the tone, the pool cuts it,
+    /// and the cut respects the Range ceiling.
+    #[test]
+    fn global_spectral_mode_suppresses_a_tone() {
+        let mut engine = EqEngine::new(SR);
+        let mut detector = Detector::new(SR);
+        let s = spectral_settings();
+
+        let out = run_spectral(&mut engine, &mut detector, &s, 1000.0, 1200);
+        assert!(
+            (out - (SINE_RMS_DB - 12.0)).abs() < 1.5,
+            "expected the ~12 dB Range cap of cut, got {out} dB"
+        );
+        assert!(engine.resonance_peak() > 10.0);
+
+        // The bank stayed out of it — this was the pool.
+        let mut curve = [0.0f32; RES_BANDS];
+        engine.resonance_reduction(&mut curve);
+        assert!(
+            curve.iter().all(|c| *c < 0.1),
+            "the bank ran in Spectral mode"
+        );
+    }
+
+    /// A band in Spectral mode tracks a resonance inside its search region —
+    /// including one well off the band centre — and leaves material outside
+    /// the region alone.
+    #[test]
+    fn a_spectral_band_tracks_inside_its_region() {
+        let band = BandPlan {
+            resonance: 1.0,
+            res_mode: BandResMode::Spectral,
+            res_range: 9.0,
+            res_width: 1.0,
+            res_attack: 2.0,
+            res_release: 20.0,
+            ..bell(3200.0, 0.0, 1.0)
+        };
+        let s = one_band(band);
+        assert!(!s.resonance.enabled, "the global stage should be off here");
+
+        // 3.84 kHz sits inside the ±1 octave region around 3.2 kHz.
+        let mut engine = EqEngine::new(SR);
+        let mut detector = Detector::new(SR);
+        let out = run_spectral(&mut engine, &mut detector, &s, 3840.0, 1200);
+        assert!(
+            (out - (SINE_RMS_DB - 9.0)).abs() < 1.5,
+            "expected the band Range of 9 dB of cut, got {out} dB"
+        );
+
+        // Confirm the filter went to the resonance, not the band centre.
+        let mut views = [TargetView::default(); MAX_TARGETS];
+        engine.spectral_view(&mut views);
+        let active: Vec<&TargetView> = views.iter().filter(|v| v.is_active()).collect();
+        assert_eq!(active.len(), 1, "expected one active target");
+        assert!(
+            (active[0].freq - 3840.0).abs() < 120.0,
+            "the filter sat at {} Hz",
+            active[0].freq
+        );
+
+        // A tone three octaves below the region comes through untouched.
+        let mut engine = EqEngine::new(SR);
+        let mut detector = Detector::new(SR);
+        let out = run_spectral(&mut engine, &mut detector, &s, 400.0, 800);
+        assert!(
+            (out - SINE_RMS_DB).abs() < 0.5,
+            "material outside the search region moved: {out} dB"
+        );
+    }
+
+    /// The Ultra-mode claim, tested the way the bank tests it: no sample of
+    /// output changes before an impulse arrives (no lookahead), and the
+    /// impulse reaches its own sample (no delay). The pool holds a live,
+    /// deep target while it happens.
+    #[test]
+    fn the_spectral_path_neither_delays_nor_looks_ahead() {
+        const AT: usize = 5;
+        let s = spectral_settings();
+
+        let make = || {
+            let engine = EqEngine::new(SR);
+            // A target planted by hand, standing in for the worker.
+            let mut frame = TargetFrame {
+                serial: 1,
+                count: 1,
+                ..TargetFrame::default()
+            };
+            frame.targets[0] = WireTarget {
+                track: 1,
+                freq: 1000.0,
+                q: 8.0,
+                excess_db: 12.0,
+                confidence: 1.0,
+                owner: -1,
+                channel: 0,
+            };
+            let mut back = 0u8;
+            engine.spectral_shared().frames.publish(&mut back, frame);
+            engine
+        };
+        let settle = |engine: &mut EqEngine| {
+            for block in 0..400 {
+                let mut l = [0.0f32; CONTROL_BLOCK];
+                for (i, x) in l.iter_mut().enumerate() {
+                    let t = (block * CONTROL_BLOCK + i) as f64 / SR as f64;
+                    *x = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+                }
+                engine.process_block(&mut l, None, &s);
+            }
+        };
+
+        let mut plain = make();
+        let mut poked = make();
+        settle(&mut plain);
+        settle(&mut poked);
+        assert!(plain.resonance_peak() > 8.0, "the pool never engaged");
+
+        let mut a = [0.0f32; CONTROL_BLOCK];
+        for (i, x) in a.iter_mut().enumerate() {
+            let t = (400 * CONTROL_BLOCK + i) as f64 / SR as f64;
+            *x = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+        }
+        let mut b = a;
+        b[AT] += 1.0;
+
+        plain.process_block(&mut a, None, &s);
+        poked.process_block(&mut b, None, &s);
+
+        for i in 0..AT {
+            assert_eq!(a[i], b[i], "sample {i} moved before the impulse reached it");
+        }
+        assert!(
+            (b[AT] - a[AT]).abs() > 0.05,
+            "the impulse did not reach its own sample: {} against {}",
+            b[AT],
+            a[AT]
+        );
+    }
+
+    /// Delta over the whole stage: what is kept plus what is removed must be
+    /// exactly what went in, with the spectral pool doing the removing.
+    #[test]
+    fn delta_covers_the_spectral_cut() {
+        let s = spectral_settings();
+        let delta = Settings {
+            resonance: ResonanceSettings {
+                delta: true,
+                ..s.resonance
+            },
+            ..s
+        };
+
+        let plant = |engine: &EqEngine| {
+            let mut frame = TargetFrame {
+                serial: 1,
+                count: 1,
+                ..TargetFrame::default()
+            };
+            frame.targets[0] = WireTarget {
+                track: 1,
+                freq: 700.0,
+                q: 8.0,
+                excess_db: 10.0,
+                confidence: 1.0,
+                owner: -1,
+                channel: 0,
+            };
+            let mut back = 0u8;
+            engine.spectral_shared().frames.publish(&mut back, frame);
+        };
+
+        let mut kept = EqEngine::new(SR);
+        let mut removed = EqEngine::new(SR);
+        plant(&kept);
+        plant(&removed);
+
+        for block in 0..400 {
+            let mut a = [0.0f32; CONTROL_BLOCK];
+            for (i, x) in a.iter_mut().enumerate() {
+                let t = (block * CONTROL_BLOCK + i) as f64 / SR as f64;
+                *x = (2.0 * std::f64::consts::PI * 700.0 * t).sin() as f32;
+            }
+            let mut b = a;
+            let dry = a;
+            kept.process_block(&mut a, None, &s);
+            removed.process_block(&mut b, None, &delta);
+            if block > 200 {
+                for i in 0..CONTROL_BLOCK {
+                    assert!(
+                        (a[i] + b[i] - dry[i]).abs() < 1e-4,
+                        "block {block} sample {i}: {} + {} != {}",
+                        a[i],
+                        b[i],
+                        dry[i]
+                    );
+                }
+            }
+        }
+        assert!(removed.resonance_peak() > 6.0, "nothing was being removed");
+    }
+
+    /// Ultra is the live tier: however hard the user turns Range up, the
+    /// global scan's automatic cuts stay conservative — deep, narrow, moving
+    /// notches are exactly what a live audience notices.
+    #[test]
+    fn ultra_quality_keeps_automatic_cuts_conservative() {
+        let mut engine = EqEngine::new(SR);
+        let mut detector = Detector::new(SR);
+        let mut s = spectral_settings();
+        s.res_quality = crate::params::ResQuality::Ultra;
+        s.resonance.range_db = 36.0;
+
+        let out = run_spectral(&mut engine, &mut detector, &s, 1000.0, 2400);
+        assert!(
+            (out - (SINE_RMS_DB - 6.0)).abs() < 1.0,
+            "Ultra should cap the automatic cut at 6 dB, got {out} dB"
+        );
+        assert!(engine.resonance_peak() < 6.5);
+
+        // And the filters live inside the tier's Q corridor.
+        let mut views = [TargetView::default(); MAX_TARGETS];
+        engine.spectral_view(&mut views);
+        for v in views.iter().filter(|v| v.is_active()) {
+            assert!(
+                (1.4..=10.1).contains(&v.q),
+                "an Ultra filter ran at Q {}",
+                v.q
+            );
+        }
+    }
+
+    /// How long the detector takes from a resonance appearing to the filter
+    /// actually biting — the *reaction time*, which is a different quantity
+    /// from the audio path's latency (0 samples) and is reported separately
+    /// on purpose.
+    #[test]
+    fn detector_reaction_time_is_bounded() {
+        let mut engine = EqEngine::new(SR);
+        let mut detector = Detector::new(SR);
+        let s = spectral_settings();
+        let shared = engine.spectral_shared();
+
+        let mut at = 0usize;
+        let mut fed = 0usize;
+        let mut onset = None;
+        let mut reacted = None;
+        // Half a second of silence, then the tone starts.
+        let silence = (SR * 0.5) as usize;
+        for block in 0..3000 {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            for (i, x) in l.iter_mut().enumerate() {
+                let n = block * CONTROL_BLOCK + i;
+                *x = if n >= silence {
+                    (2.0 * std::f64::consts::PI * 1000.0 * at as f64 / SR as f64).sin() as f32
+                } else {
+                    0.0
+                };
+                if n >= silence {
+                    at += 1;
+                }
+            }
+            engine.process_block(&mut l, None, &s);
+            fed += CONTROL_BLOCK;
+            if fed >= detector.hop {
+                fed = 0;
+                detector.analyze(&shared);
+            }
+            let n = (block + 1) * CONTROL_BLOCK;
+            if n >= silence && onset.is_none() {
+                onset = Some(n);
+            }
+            if onset.is_some() && reacted.is_none() && engine.resonance_peak() > 1.0 {
+                reacted = Some(n);
+            }
+        }
+
+        let (onset, reacted) = (onset.unwrap(), reacted.expect("never engaged"));
+        let ms = (reacted - onset) as f32 / SR * 1000.0;
+        println!("detector reaction: {ms:.0} ms from onset to >1 dB of cut");
+        // Window (43 ms) + confidence build + attack: comfortably under a
+        // quarter second, and it must not be instant either — instant would
+        // mean the hysteresis was bypassed.
+        assert!(
+            (30.0..250.0).contains(&ms),
+            "reaction time was {ms} ms"
+        );
+    }
+
+    /// Flipping the delta monitor mid-cut must fade, not click: no sample
+    /// step in the output beyond what the tone itself moves per sample.
+    #[test]
+    fn toggling_delta_is_click_safe() {
+        let mut on = spectral_settings();
+        let mut engine = EqEngine::new(SR);
+
+        let mut frame = TargetFrame {
+            serial: 1,
+            count: 1,
+            ..TargetFrame::default()
+        };
+        frame.targets[0] = WireTarget {
+            track: 1,
+            freq: 1000.0,
+            q: 8.0,
+            excess_db: 10.0,
+            confidence: 1.0,
+            owner: -1,
+            channel: 0,
+        };
+        let mut back = 0u8;
+        engine.spectral_shared().frames.publish(&mut back, frame);
+
+        let mut last = 0.0f32;
+        let mut max_step = 0.0f32;
+        for block in 0..1200 {
+            // Toggle the monitor twice, mid-suppression.
+            if block == 600 {
+                on.resonance.delta = true;
+            }
+            if block == 900 {
+                on.resonance.delta = false;
+            }
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            for (i, x) in l.iter_mut().enumerate() {
+                let t = (block * CONTROL_BLOCK + i) as f64 / SR as f64;
+                *x = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32 * 0.5;
+            }
+            engine.process_block(&mut l, None, &on);
+            for x in l {
+                if block > 2 {
+                    max_step = max_step.max((x - last).abs());
+                }
+                last = x;
+            }
+        }
+        // A 1 kHz half-scale sine moves at most ~0.065 a sample; a hard delta
+        // switch would step by the full removed component at once.
+        assert!(max_step < 0.1, "delta toggling stepped by {max_step}");
+    }
+
+    /// The whole spectral loop with the real worker thread in it: audio fed
+    /// through the engine, the worker finding the tone on its own clock, the
+    /// pool engaging — and the thread joining cleanly when the worker drops.
+    #[test]
+    fn the_worker_thread_feeds_the_pool() {
+        use crate::dsp::spectral::SpectralWorker;
+
+        let mut engine = EqEngine::new(SR);
+        let worker = SpectralWorker::spawn(engine.spectral_shared());
+        let s = spectral_settings();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut at = 0usize;
+        let mut engaged = false;
+        while std::time::Instant::now() < deadline {
+            let mut l = [0.0f32; CONTROL_BLOCK];
+            let mut r = [0.0f32; CONTROL_BLOCK];
+            for i in 0..CONTROL_BLOCK {
+                let t = (at + i) as f64 / SR as f64;
+                let x = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+                l[i] = x;
+                r[i] = x;
+            }
+            at += CONTROL_BLOCK;
+            engine.process_block(&mut l, Some(&mut r), &s);
+            if engine.resonance_peak() > 6.0 {
+                engaged = true;
+                break;
+            }
+            // Pace the feed near real time so the worker's own cadence — a
+            // few milliseconds of wall clock per pass — gets its turns.
+            std::thread::sleep(std::time::Duration::from_micros(300));
+        }
+        assert!(engaged, "the worker never drove the pool into a cut");
+        drop(worker); // joins, or this test hangs — which is the assertion
+    }
+
+    /// Rough throughput of the whole engine, printed as a multiple of real
+    /// time. Not an assertion — numbers this depends on belong to the machine
+    /// it runs on. `cargo test --release --lib engine_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore = "prints timings; run explicitly in release"]
+    fn engine_throughput() {
+        let seconds = 30.0f32;
+        let blocks = (seconds * SR / CONTROL_BLOCK as f32) as usize;
+
+        let mut cases: Vec<(&str, Settings)> = vec![
+            ("idle (no resonance)", Settings::default()),
+            (
+                "adaptive (bank)",
+                Settings {
+                    resonance: suppressing(),
+                    ..Settings::default()
+                },
+            ),
+            ("spectral (pool, 8 targets)", spectral_settings()),
+        ];
+        // Give the spectral case a full pool to run.
+        if let Some((_, s)) = cases.last_mut() {
+            s.res_quality = crate::params::ResQuality::Ultra;
+        }
+
+        for (name, s) in cases {
+            let mut engine = EqEngine::new(SR);
+            if name.starts_with("spectral") {
+                let mut frame = TargetFrame {
+                    serial: 1,
+                    count: 8,
+                    ..TargetFrame::default()
+                };
+                for (i, t) in frame.targets[..8].iter_mut().enumerate() {
+                    *t = WireTarget {
+                        track: i as u32 + 1,
+                        freq: 200.0 * 2f32.powf(i as f32 * 0.8),
+                        q: 8.0,
+                        excess_db: 9.0,
+                        confidence: 1.0,
+                        owner: -1,
+                        channel: 0,
+                    };
+                }
+                let mut back = 0u8;
+                engine.spectral_shared().frames.publish(&mut back, frame);
+            }
+
+            let mut l = [0.25f32; CONTROL_BLOCK];
+            let mut r = [0.25f32; CONTROL_BLOCK];
+            let start = std::time::Instant::now();
+            for block in 0..blocks {
+                for i in 0..CONTROL_BLOCK {
+                    let t = (block * CONTROL_BLOCK + i) as f32 / SR;
+                    let x = (2.0 * PI * 220.0 * t).sin() * 0.4 + (2.0 * PI * 3130.0 * t).sin() * 0.2;
+                    l[i] = x;
+                    r[i] = x * 0.8;
+                }
+                engine.process_block(&mut l, Some(&mut r), &s);
+            }
+            let took = start.elapsed().as_secs_f32();
+            println!(
+                "{name}: {seconds} s of stereo audio in {took:.3} s — {:.0}x real time",
+                seconds / took
+            );
+        }
+
+        // And the detector on its own, per analysis pass.
+        let shared = SharedSpectral::default();
+        shared.cfg.publish(&crate::dsp::spectral::ConfigView {
+            sample_rate: SR,
+            global_on: true,
+            quality: 2,
+            ..crate::dsp::spectral::ConfigView::default()
+        });
+        let mut detector = Detector::new(SR);
+        for i in 0..detector.hop * 8 {
+            let x = (2.0 * PI * 1000.0 * i as f32 / SR).sin() * 0.5;
+            shared.ring.push(x, x);
+        }
+        let passes = 2000;
+        let start = std::time::Instant::now();
+        for _ in 0..passes {
+            detector.analyze(&shared);
+        }
+        let per_pass = start.elapsed().as_secs_f32() / passes as f32;
+        println!(
+            "detector: {:.0} µs per pass, one pass every {:.1} ms of audio",
+            per_pass * 1e6,
+            detector.hop as f32 / SR * 1000.0
+        );
+    }
+
+    /// The spectral engines follow the sample rate: detector sizing and pool
+    /// coefficients both derive from it, at every supported rate.
+    #[test]
+    fn spectral_mode_works_across_sample_rates() {
+        for sr in [44_100.0f32, 96_000.0, 192_000.0] {
+            let mut engine = EqEngine::new(sr);
+            let mut detector = Detector::new(sr);
+            let s = spectral_settings();
+
+            let shared = engine.spectral_shared();
+            let mut sum = 0.0f64;
+            let mut counted = 0usize;
+            let mut fed = 0usize;
+            let blocks = (sr / 48_000.0 * 1200.0) as usize;
+            for block in 0..blocks {
+                let mut l = [0.0f32; CONTROL_BLOCK];
+                let mut r = [0.0f32; CONTROL_BLOCK];
+                for i in 0..CONTROL_BLOCK {
+                    let t = (block * CONTROL_BLOCK + i) as f64 / sr as f64;
+                    let x = (2.0 * std::f64::consts::PI * 1000.0 * t).sin() as f32;
+                    l[i] = x;
+                    r[i] = x;
+                }
+                engine.process_block(&mut l, Some(&mut r), &s);
+                fed += CONTROL_BLOCK;
+                if fed >= detector.hop {
+                    fed = 0;
+                    detector.analyze(&shared);
+                }
+                if block >= blocks / 2 {
+                    for x in l {
+                        sum += (x * x) as f64;
+                        counted += 1;
+                    }
+                }
+            }
+            let out = 20.0 * ((sum / counted as f64).sqrt().max(1e-9) as f32).log10();
+            assert!(
+                (out - (SINE_RMS_DB - 12.0)).abs() < 2.0,
+                "{sr} Hz: expected the 12 dB Range of cut, got {out} dB"
+            );
         }
     }
 }

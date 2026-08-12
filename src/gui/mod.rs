@@ -85,6 +85,7 @@ struct Readings {
     delta: Vec<f32>,
     resonance: Vec<f32>,
     resonance_peak: f32,
+    targets: Vec<crate::dsp::spectral::TargetView>,
 }
 
 struct View {
@@ -113,6 +114,10 @@ impl App {
                 delta: vec![0.0; MAX_BANDS],
                 resonance: vec![0.0; RES_BANDS],
                 resonance_peak: 0.0,
+                targets: vec![
+                    crate::dsp::spectral::TargetView::default();
+                    crate::dsp::spectral::MAX_TARGETS
+                ],
             },
             view: View::new(sample_rate),
         }
@@ -158,6 +163,7 @@ pub fn create(ctx: EditorContext) -> Option<Box<dyn Editor>> {
 
             ctx.meters.read_into(&mut readings.level, &mut readings.delta);
             readings.resonance_peak = ctx.meters.read_resonance(&mut readings.resonance);
+            ctx.meters.read_targets(&mut readings.targets);
 
             // The view state belongs to the user once they have touched it, so
             // it is restored once and then owned here.
@@ -179,6 +185,7 @@ pub fn create(ctx: EditorContext) -> Option<Box<dyn Editor>> {
                 delta: &readings.delta,
                 resonance: &readings.resonance,
                 resonance_peak: readings.resonance_peak,
+                res_targets: &readings.targets,
                 spectrum_pre: pre,
                 spectrum_post: post,
                 sample_rate,
@@ -481,15 +488,24 @@ mod tests {
             attack: 20.0,
             release: 200.0,
             resonance: 40.0,
+            res_mode: crate::params::BandResMode::Adaptive,
+            res_range: 36.0,
+            res_sens: 0.0,
+            res_width: 1.0,
+            res_attack: 5.0,
+            res_release: 40.0,
         }
     }
 
     /// One of everything that draws differently: a cut (slope row live, no gain
     /// and no Q), a dynamic bell (meter, travel marker, per-frame curve), and a
     /// disabled side-only shelf (badge, dimmed, hidden in most channel views).
+    /// The cut takes the steepest slope on offer — the near-vertical edge is
+    /// where curve rendering artifacts show first.
     pub(super) fn a_bit_of_everything() -> Vec<state::BandView> {
-        let mut cut = band(0, BandKind::LowCut, 80.0);
+        let mut cut = band(0, BandKind::LowCut, 40.0);
         cut.gain = 0.0;
+        cut.slope = crate::params::Slope::S96;
 
         let mut dynamic = band(1, BandKind::Bell, 1000.0);
         dynamic.dynamic = true;
@@ -521,6 +537,21 @@ mod tests {
         let delta = vec![-2.5f32; MAX_BANDS];
         let resonance = vec![3.0f32; RES_BANDS];
         let spectrum = vec![-60.0f32; crate::analyzer::LOG_POINTS];
+        // A couple of spectral targets, so the overlay path is exercised too.
+        let mut targets =
+            vec![crate::dsp::spectral::TargetView::default(); crate::dsp::spectral::MAX_TARGETS];
+        targets[0] = crate::dsp::spectral::TargetView {
+            freq: 3840.0,
+            cut_db: 4.0,
+            q: 8.0,
+            confidence: 0.9,
+        };
+        targets[1] = crate::dsp::spectral::TargetView {
+            freq: 250.0,
+            cut_db: 0.0,
+            q: 12.0,
+            confidence: 0.4,
+        };
         let fx = view.fx.clone();
         let frame = Frame {
             setter: &setter,
@@ -530,6 +561,7 @@ mod tests {
             delta: &delta,
             resonance: &resonance,
             resonance_peak: 4.2,
+            res_targets: &targets,
             spectrum_pre: &spectrum,
             spectrum_post: &spectrum,
             sample_rate: 48_000.0,
@@ -876,6 +908,14 @@ mod tests {
         let bands = a_bit_of_everything();
         view.selected = Some(1);
 
+        // `EQUZX_PREVIEW_MENU=<id>` renders with that popover open — the only
+        // way to look at a menu's layout without a pointer.
+        if let Ok(menu) = std::env::var("EQUZX_PREVIEW_MENU") {
+            harness
+                .ctx
+                .data_mut(|d| d.insert_temp(Id::new(menu), true));
+        }
+
         // A few passes, because the first is egui measuring its areas.
         let mut atlas = None;
         let mut primitives = Vec::new();
@@ -896,6 +936,16 @@ mod tests {
                     -34.0 - 46.0 * t + 9.0 * (t * 26.0).sin()
                 })
                 .collect();
+            let mut targets = vec![
+                crate::dsp::spectral::TargetView::default();
+                crate::dsp::spectral::MAX_TARGETS
+            ];
+            targets[0] = crate::dsp::spectral::TargetView {
+                freq: 5200.0,
+                cut_db: 3.0,
+                q: 10.0,
+                confidence: 0.8,
+            };
             let fx = view.fx.clone();
             let frame = Frame {
                 setter: &setter,
@@ -905,6 +955,7 @@ mod tests {
                 delta: &delta,
                 resonance: &resonance,
                 resonance_peak: 5.0,
+                res_targets: &targets,
                 spectrum_pre: &spectrum,
                 spectrum_post: &spectrum,
                 sample_rate: 48_000.0,
@@ -949,6 +1000,33 @@ mod tests {
 
     /// The window sizes a host is likely to hand the editor, including the
     /// floor and something much larger than the default.
+    /// The two resonance popovers — the header stage controls and a band's
+    /// compact RES section — laid out and tessellated with everything open.
+    /// Menus only build their contents while open, so without this a layout
+    /// panic inside either would go unseen until someone clicked.
+    #[test]
+    fn the_resonance_popups_lay_out() {
+        let (harness, mut view) = fixture();
+        let bands = a_bit_of_everything();
+        view.selected = Some(0);
+        harness.ctx.data_mut(|d| {
+            d.insert_temp(Id::new("resonance-menu"), true);
+            d.insert_temp(Id::new(("band-res-menu", 0usize)), true);
+        });
+        for _ in 0..3 {
+            let primitives = run_frame(&harness, &mut view, &bands);
+            assert!(!primitives.is_empty());
+        }
+        // Both stayed open across the frames — nothing inside them panicked
+        // or closed them by accident.
+        assert!(harness
+            .ctx
+            .data(|d| d.get_temp::<bool>(Id::new("resonance-menu")).unwrap_or(false)));
+        assert!(harness.ctx.data(|d| d
+            .get_temp::<bool>(Id::new(("band-res-menu", 0usize)))
+            .unwrap_or(false)));
+    }
+
     #[test]
     fn the_panels_hold_together_at_any_window_size() {
         for (width, height) in [

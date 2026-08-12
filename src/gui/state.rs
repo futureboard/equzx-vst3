@@ -17,8 +17,35 @@
 use serde::{Deserialize, Serialize};
 
 use crate::params::{
-    BandChannel, BandKind, DynMode, EquzxParams, ResonanceParams, Slope, MAX_BANDS,
+    BandChannel, BandKind, BandResMode, DynMode, EquzxParams, ResMode, ResQuality,
+    ResonanceParams, Slope, MAX_BANDS,
 };
+
+// The resonance enums travel as their wire names, like every other enum in a
+// preset — implemented here so `params` stays serde-free.
+
+macro_rules! wire_serde {
+    ($ty:ty, $default:expr) => {
+        impl Serialize for $ty {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(self.as_wire())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let s = String::deserialize(deserializer)?;
+                // A name this build does not know lands on the default rather
+                // than failing the whole preset.
+                Ok(<$ty>::from_wire(&s).unwrap_or($default))
+            }
+        }
+    };
+}
+
+wire_serde!(ResMode, ResMode::Adaptive);
+wire_serde!(ResQuality, ResQuality::Ultra);
+wire_serde!(BandResMode, BandResMode::Adaptive);
 
 // --- a band, as the UI reads it ---------------------------------------------
 
@@ -43,6 +70,15 @@ pub struct BandView {
     pub release: f32,
     /// Per-band resonance suppression, 0..100 as the UI shows it.
     pub resonance: f32,
+    pub res_mode: BandResMode,
+    /// Ceiling on this band's resonance cut, in dB.
+    pub res_range: f32,
+    /// dB taken off the detection threshold inside this band's region.
+    pub res_sens: f32,
+    /// Spectral search half-width, octaves either side of the band.
+    pub res_width: f32,
+    pub res_attack: f32,
+    pub res_release: f32,
 }
 
 impl BandView {
@@ -112,6 +148,12 @@ pub fn read_bands(params: &EquzxParams) -> Vec<BandView> {
             attack: p.attack.value(),
             release: p.release.value(),
             resonance: p.resonance.value() * 100.0,
+            res_mode: p.res_mode.value(),
+            res_range: p.res_range.value(),
+            res_sens: p.res_sens.value(),
+            res_width: p.res_width.value(),
+            res_attack: p.res_attack.value(),
+            res_release: p.res_release.value(),
         });
     }
     bands
@@ -348,6 +390,12 @@ pub struct BandSnapshot {
     pub attack: f32,
     pub release: f32,
     pub resonance: f32,
+    pub res_mode: BandResMode,
+    pub res_range: f32,
+    pub res_sens: f32,
+    pub res_width: f32,
+    pub res_attack: f32,
+    pub res_release: f32,
 }
 
 /// The shape a band is created with — the same one `makeBand` used to hand out.
@@ -368,6 +416,12 @@ impl Default for BandSnapshot {
             attack: 20.0,
             release: 200.0,
             resonance: 0.0,
+            res_mode: BandResMode::Adaptive,
+            res_range: 36.0,
+            res_sens: 0.0,
+            res_width: 1.0,
+            res_attack: 5.0,
+            res_release: 40.0,
         }
     }
 }
@@ -389,6 +443,12 @@ impl From<&BandView> for BandSnapshot {
             attack: b.attack,
             release: b.release,
             resonance: b.resonance,
+            res_mode: b.res_mode,
+            res_range: b.res_range,
+            res_sens: b.res_sens,
+            res_width: b.res_width,
+            res_attack: b.res_attack,
+            res_release: b.res_release,
         }
     }
 }
@@ -404,6 +464,11 @@ impl BandSnapshot {
             attack: finite(self.attack, 20.0).clamp(1.0, 300.0),
             release: finite(self.release, 200.0).clamp(10.0, 2000.0),
             resonance: finite(self.resonance, 0.0).clamp(0.0, 100.0),
+            res_range: finite(self.res_range, 36.0).clamp(0.0, 36.0),
+            res_sens: finite(self.res_sens, 0.0).clamp(-12.0, 12.0),
+            res_width: finite(self.res_width, 1.0).clamp(0.25, 2.0),
+            res_attack: finite(self.res_attack, 5.0).clamp(0.5, 100.0),
+            res_release: finite(self.res_release, 40.0).clamp(5.0, 1000.0),
             ..*self
         }
     }
@@ -414,6 +479,10 @@ impl BandSnapshot {
 #[serde(default, rename_all = "camelCase")]
 pub struct ResonanceSnapshot {
     pub enabled: bool,
+    pub mode: ResMode,
+    pub quality: ResQuality,
+    /// Ceiling on any single cut, in dB.
+    pub range: f32,
     /// The three ratios travel as percentages, the units the UI shows.
     pub depth: f32,
     pub sharpness: f32,
@@ -429,6 +498,9 @@ impl Default for ResonanceSnapshot {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: ResMode::Adaptive,
+            quality: ResQuality::Ultra,
+            range: 36.0,
             depth: 50.0,
             sharpness: 50.0,
             threshold: 6.0,
@@ -445,6 +517,9 @@ impl ResonanceSnapshot {
     pub fn capture(p: &ResonanceParams) -> Self {
         Self {
             enabled: p.enabled.value(),
+            mode: p.mode.value(),
+            quality: p.quality.value(),
+            range: p.range.value(),
             depth: p.depth.value() * 100.0,
             sharpness: p.sharpness.value() * 100.0,
             threshold: p.threshold.value(),
@@ -460,6 +535,9 @@ impl ResonanceSnapshot {
         let d = Self::default();
         Self {
             enabled: self.enabled,
+            mode: self.mode,
+            quality: self.quality,
+            range: finite(self.range, d.range).clamp(0.0, 36.0),
             depth: finite(self.depth, d.depth).clamp(0.0, 100.0),
             sharpness: finite(self.sharpness, d.sharpness).clamp(0.0, 100.0),
             threshold: finite(self.threshold, d.threshold).clamp(-12.0, 24.0),
@@ -505,6 +583,12 @@ struct BandWire {
     attack: f32,
     release: f32,
     resonance: f32,
+    res_mode: BandResMode,
+    res_range: f32,
+    res_sens: f32,
+    res_width: f32,
+    res_attack: f32,
+    res_release: f32,
 }
 
 impl Default for BandWire {
@@ -524,6 +608,12 @@ impl Default for BandWire {
             attack: 20.0,
             release: 200.0,
             resonance: 0.0,
+            res_mode: BandResMode::Adaptive,
+            res_range: 36.0,
+            res_sens: 0.0,
+            res_width: 1.0,
+            res_attack: 5.0,
+            res_release: 40.0,
         }
     }
 }
@@ -547,6 +637,12 @@ impl From<BandWire> for BandSnapshot {
             attack: w.attack,
             release: w.release,
             resonance: w.resonance,
+            res_mode: w.res_mode,
+            res_range: w.res_range,
+            res_sens: w.res_sens,
+            res_width: w.res_width,
+            res_attack: w.res_attack,
+            res_release: w.res_release,
         }
         .sanitized()
     }
@@ -569,6 +665,12 @@ impl From<BandSnapshot> for BandWire {
             attack: b.attack,
             release: b.release,
             resonance: b.resonance,
+            res_mode: b.res_mode,
+            res_range: b.res_range,
+            res_sens: b.res_sens,
+            res_width: b.res_width,
+            res_attack: b.res_attack,
+            res_release: b.res_release,
         }
     }
 }
@@ -744,6 +846,12 @@ mod tests {
             attack: 20.0,
             release: 200.0,
             resonance: 0.0,
+            res_mode: BandResMode::Adaptive,
+            res_range: 36.0,
+            res_sens: 0.0,
+            res_width: 1.0,
+            res_attack: 5.0,
+            res_release: 40.0,
         };
         assert!(band.in_view(ChannelView::All));
         assert!(band.in_view(ChannelView::Mid));

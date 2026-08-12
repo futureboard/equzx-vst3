@@ -380,6 +380,7 @@ fn filter_row(
         {
             edit::set_band_resonance(frame, band.slot, v);
         }
+        res_menu(ui, frame, band, color);
 
         // --- slope --------------------------------------------------------
         let is_cut = band.kind.is_cut();
@@ -632,6 +633,144 @@ fn dyn_meter(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
         white(64),
     );
     ui.allocate_rect(rect, Sense::hover());
+}
+
+/// The rest of the band's resonance controls, behind a chevron next to the Res
+/// knob — progressive disclosure, so the everyday inspector stays four knobs
+/// wide and the search-region tuning is one click away when wanted.
+fn res_menu(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
+    use crate::gui::widgets::menu;
+    use crate::params::BandResMode;
+
+    let id = nih_plug_egui::egui::Id::new(("band-res-menu", band.slot));
+    let anchor = menu::trigger_with(ui, id, 16.0, Fill::None, |ui, rect, _| {
+        ui.painter().add(glyph::chevron(
+            rect,
+            crate::gui::anim::state(ui.ctx(), id.with("chev"), menu::is_open(ui, id), 0.15),
+            white(110),
+        ));
+    });
+
+    menu::popup(
+        ui,
+        id,
+        anchor,
+        crate::gui::widgets::menu::Align::Start,
+        286.0,
+        frame.fx,
+        |ui, _| {
+            menu::label(ui, "Adaptive resonance — this band");
+
+            let mode = band.res_mode;
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                let current = match mode {
+                    BandResMode::Off => 0,
+                    BandResMode::Adaptive => 1,
+                    BandResMode::Spectral => 2,
+                };
+                if let Some(i) = chrome::segmented(
+                    ui,
+                    &["Off", "Adaptive", "Spectral"],
+                    current,
+                    color,
+                    58.0,
+                    22.0,
+                    FontId::proportional(theme::TINY),
+                ) {
+                    edit::set_band_res_mode(
+                        frame,
+                        band.slot,
+                        [BandResMode::Off, BandResMode::Adaptive, BandResMode::Spectral][i],
+                    );
+                }
+            });
+            ui.add_space(2.0);
+
+            let live = mode != BandResMode::Off;
+            let spectral = mode == BandResMode::Spectral;
+            let db = |v: f32| format!("{v:.1}");
+            let oct = |v: f32| format!("±{v:.2}");
+            let ms_fine = |v: f32| format!("{v:.1}m");
+            let ms = |v: f32| format!("{v:.0}m");
+
+            ui.horizontal(|ui| {
+                ui.add_space(14.0);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if let Some(v) = Knob::new("Range", band.res_range, 0.0, 36.0, &db)
+                    .default_value(36.0)
+                    .color(color)
+                    .disabled(!live)
+                    .size(32.0)
+                    .show(ui)
+                {
+                    edit::set_band_res_range(frame, band.slot, v);
+                }
+                if let Some(v) = Knob::new("Sens", band.res_sens, -12.0, 12.0, &db)
+                    .default_value(0.0)
+                    .color(color)
+                    .disabled(!live)
+                    .size(32.0)
+                    .show(ui)
+                {
+                    edit::set_band_res_sens(frame, band.slot, v);
+                }
+                // The search region is the spectral tracker's leash; the bank
+                // works from the band's own shape instead.
+                if let Some(v) = Knob::new("Width", band.res_width, 0.25, 2.0, &oct)
+                    .log(true)
+                    .default_value(1.0)
+                    .color(color)
+                    .disabled(!spectral)
+                    .size(32.0)
+                    .show(ui)
+                {
+                    edit::set_band_res_width(frame, band.slot, v);
+                }
+                if let Some(v) = Knob::new("Attack", band.res_attack, 0.5, 100.0, &ms_fine)
+                    .log(true)
+                    .default_value(5.0)
+                    .color(color)
+                    .disabled(!live)
+                    .size(32.0)
+                    .show(ui)
+                {
+                    edit::set_band_res_attack(frame, band.slot, v);
+                }
+                if let Some(v) = Knob::new("Rel", band.res_release, 5.0, 1000.0, &ms)
+                    .log(true)
+                    .default_value(40.0)
+                    .color(color)
+                    .disabled(!live)
+                    .size(32.0)
+                    .show(ui)
+                {
+                    edit::set_band_res_release(frame, band.slot, v);
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    ui.set_max_width(254.0);
+                    ui.label(
+                        nih_plug_egui::egui::RichText::new(if spectral {
+                            "The detector tracks the strongest resonances within the \
+                             search width either side of the band's frequency — the \
+                             band stays put, the notch follows the ringing."
+                        } else {
+                            "Suppression works across the region this band's shape \
+                             covers. The Res knob sets how much of the excess goes."
+                        })
+                        .font(FontId::proportional(theme::TINY))
+                        .color(white(90)),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+        },
+    );
 }
 
 /// Shelves are fixed at S = 1 in the engine, so exposing a Q for them would be a

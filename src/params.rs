@@ -211,6 +211,114 @@ impl Slope {
     }
 }
 
+/// What the global resonance stage runs as, once it is switched on.
+///
+/// Adaptive is the sixth-octave filter bank in [`crate::dsp::resonance`];
+/// Spectral is the FFT detector and adaptive filter pool in
+/// [`crate::dsp::spectral`]. Both are time-domain in the audio path — the
+/// choice is about how resonances are *found*, not whether latency is added.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResMode {
+    #[id = "adaptive"]
+    Adaptive,
+    #[id = "spectral"]
+    Spectral,
+}
+
+impl ResMode {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ResMode::Adaptive => "adaptive",
+            ResMode::Spectral => "spectral",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "adaptive" => ResMode::Adaptive,
+            "spectral" => ResMode::Spectral,
+            _ => return None,
+        })
+    }
+}
+
+/// How many adaptive filters the spectral stage may run at once.
+///
+/// Named for what the user is choosing — the leanest tier is the one meant for
+/// tracking and monitoring chains, hence "Ultra". None of the tiers change the
+/// audio path's latency, which is zero in all of them.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResQuality {
+    #[id = "ultra"]
+    Ultra,
+    #[id = "balanced"]
+    Balanced,
+    #[id = "high"]
+    High,
+}
+
+impl ResQuality {
+    /// Simultaneous adaptive targets this tier allows.
+    pub fn max_targets(self) -> usize {
+        match self {
+            ResQuality::Ultra => 8,
+            ResQuality::Balanced => 16,
+            ResQuality::High => 24,
+        }
+    }
+
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ResQuality::Ultra => "ultra",
+            ResQuality::Balanced => "balanced",
+            ResQuality::High => "high",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "ultra" => ResQuality::Ultra,
+            "balanced" => ResQuality::Balanced,
+            "high" => ResQuality::High,
+            _ => return None,
+        })
+    }
+}
+
+/// How a band's own resonance amount finds what it suppresses.
+///
+/// The default is Adaptive rather than Off on purpose: the amount itself
+/// defaults to zero, so a fresh band is still inert, and every session saved
+/// before the mode existed had exactly this behaviour behind its amount.
+#[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BandResMode {
+    #[id = "off"]
+    Off,
+    #[id = "adaptive"]
+    Adaptive,
+    #[id = "spectral"]
+    Spectral,
+}
+
+impl BandResMode {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            BandResMode::Off => "off",
+            BandResMode::Adaptive => "adaptive",
+            BandResMode::Spectral => "spectral",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "off" => BandResMode::Off,
+            "adaptive" => BandResMode::Adaptive,
+            "spectral" => BandResMode::Spectral,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DynMode {
     /// Engages once the band's level rises past the threshold.
@@ -278,6 +386,27 @@ pub struct BandParams {
     /// whatever static curve the band is drawing. Zero is off.
     #[id = "res"]
     pub resonance: FloatParam,
+    /// How that amount finds its resonances — the sixth-octave bank, or the
+    /// spectral detector tracking a peak inside the band's search region.
+    #[id = "rsm"]
+    pub res_mode: EnumParam<BandResMode>,
+    /// Ceiling on the cut this band may ask for, in dB.
+    #[id = "rsr"]
+    pub res_range: FloatParam,
+    /// dB taken off the detection threshold inside this band's region —
+    /// positive makes the band more eager than the global stage.
+    #[id = "rss"]
+    pub res_sens: FloatParam,
+    /// Half-width of the spectral search region, in octaves either side of the
+    /// band's frequency. The detected resonance may sit anywhere inside it.
+    #[id = "rsw"]
+    pub res_width: FloatParam,
+    /// Ballistics for this band's resonance attenuation, distinct from the
+    /// dynamics section's attack/release, which move the band's own gain.
+    #[id = "rsa"]
+    pub res_attack: FloatParam,
+    #[id = "rsrl"]
+    pub res_release: FloatParam,
 }
 
 impl Default for BandParams {
@@ -382,6 +511,68 @@ impl Default for BandParams {
                 .with_unit("%")
                 .with_value_to_string(formatters::v2s_f32_percentage(0))
                 .with_string_to_value(formatters::s2v_f32_percentage()),
+
+            res_mode: EnumParam::new("Res Mode", BandResMode::Adaptive),
+
+            // Defaults to the bank's own hard ceiling, so a session from before
+            // the control existed keeps its exact behaviour.
+            res_range: FloatParam::new(
+                "Res Range",
+                36.0,
+                FloatRange::Linear { min: 0.0, max: 36.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(30.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            res_sens: FloatParam::new(
+                "Res Sensitivity",
+                0.0,
+                FloatRange::Linear {
+                    min: -12.0,
+                    max: 12.0,
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(30.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            res_width: FloatParam::new(
+                "Res Width",
+                1.0,
+                FloatRange::Skewed {
+                    min: 0.25,
+                    max: 2.0,
+                    factor: FloatRange::skew_factor(-0.5),
+                },
+            )
+            .with_smoother(SmoothingStyle::Linear(30.0))
+            .with_unit(" oct")
+            .with_value_to_string(formatters::v2s_f32_rounded(2)),
+
+            res_attack: FloatParam::new(
+                "Res Attack",
+                5.0,
+                FloatRange::Skewed {
+                    min: 0.5,
+                    max: 100.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
+
+            res_release: FloatParam::new(
+                "Res Release",
+                40.0,
+                FloatRange::Skewed {
+                    min: 5.0,
+                    max: 1000.0,
+                    factor: FloatRange::skew_factor(-1.5),
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(formatters::v2s_f32_rounded(0)),
         }
     }
 }
@@ -395,6 +586,17 @@ impl Default for BandParams {
 pub struct ResonanceParams {
     #[id = "rson"]
     pub enabled: BoolParam,
+    /// Which engine the switch arms — see [`ResMode`]. Kept apart from
+    /// `enabled` so the automation lane hosts already wrote for the switch
+    /// keeps meaning on/off.
+    #[id = "rsmod"]
+    pub mode: EnumParam<ResMode>,
+    /// Adaptive filter budget for the spectral engine — see [`ResQuality`].
+    #[id = "rsqua"]
+    pub quality: EnumParam<ResQuality>,
+    /// Ceiling on any single cut the stage makes, in dB.
+    #[id = "rsrng"]
+    pub range: FloatParam,
     #[id = "rsdep"]
     pub depth: FloatParam,
     #[id = "rssh"]
@@ -422,6 +624,20 @@ impl Default for ResonanceParams {
             // exactly as it did, and a suppressor nobody asked for is the last
             // thing anyone wants finding resonances in their mix.
             enabled: BoolParam::new("Resonance", false),
+
+            mode: EnumParam::new("Resonance Mode", ResMode::Adaptive),
+            quality: EnumParam::new("Resonance Quality", ResQuality::Ultra),
+
+            // The bank's historical hard ceiling, so pre-existing sessions
+            // keep their exact behaviour with the control at its default.
+            range: FloatParam::new(
+                "Resonance Range",
+                36.0,
+                FloatRange::Linear { min: 0.0, max: 36.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(30.0))
+            .with_unit(" dB")
+            .with_value_to_string(formatters::v2s_f32_rounded(1)),
 
             depth: FloatParam::new("Resonance Depth", 0.5, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_smoother(SmoothingStyle::Linear(30.0))

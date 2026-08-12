@@ -21,6 +21,7 @@ pub mod version;
 use crate::analyzer::Taps;
 use crate::dsp::engine::{settings_for_block, EqEngine, CONTROL_BLOCK};
 use crate::dsp::resonance::RES_BANDS;
+use crate::dsp::spectral::{SpectralWorker, TargetView, MAX_TARGETS};
 use crate::meters::Meters;
 use crate::params::{EquzxParams, TransientState, MAX_BANDS};
 
@@ -32,9 +33,15 @@ pub struct Equzx {
     /// Published for the editor, which needs the rate to map bins to frequencies.
     sample_rate: Arc<AtomicF32>,
     engine: EqEngine,
+    /// The spectral analysis thread. Spawned on `initialize` — never from the
+    /// audio callback — and joined when the plugin is dropped. It idles at a
+    /// few wakeups a second while no spectral mode is armed.
+    spectral_worker: Option<SpectralWorker>,
     /// Somewhere to read the resonance curve into on the way to the meters,
     /// owned here so `process` never allocates.
     resonance_curve: [f32; RES_BANDS],
+    /// Same for the spectral target views.
+    target_views: [TargetView; MAX_TARGETS],
 }
 
 impl Default for Equzx {
@@ -46,7 +53,9 @@ impl Default for Equzx {
             meters: Arc::new(Meters::default()),
             sample_rate: Arc::new(AtomicF32::new(48_000.0)),
             engine: EqEngine::new(48_000.0),
+            spectral_worker: None,
             resonance_curve: [0.0; RES_BANDS],
+            target_views: [TargetView::default(); MAX_TARGETS],
         }
     }
 }
@@ -104,6 +113,9 @@ impl Plugin for Equzx {
         self.sample_rate
             .store(config.sample_rate, Ordering::Relaxed);
         self.engine.set_sample_rate(config.sample_rate);
+        if self.spectral_worker.is_none() {
+            self.spectral_worker = Some(SpectralWorker::spawn(self.engine.spectral_shared()));
+        }
         true
     }
 
@@ -188,6 +200,8 @@ impl Plugin for Equzx {
         self.engine.resonance_reduction(&mut self.resonance_curve);
         self.meters
             .publish_resonance(&self.resonance_curve, self.engine.resonance_peak());
+        self.engine.spectral_view(&mut self.target_views);
+        self.meters.publish_targets(&self.target_views);
 
         ProcessStatus::Normal
     }

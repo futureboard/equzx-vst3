@@ -17,6 +17,7 @@ use crate::gui::widgets::chrome::{self, Fill, PILL_HEIGHT};
 use crate::gui::widgets::menu::{self, Align};
 use crate::gui::widgets::glyph;
 use crate::gui::widgets::Knob;
+use crate::params::{ResMode, ResQuality};
 
 /// The switch and its chevron, as one control.
 ///
@@ -133,6 +134,45 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
     menu::popup(ui, id, combined, Align::End, 300.0, fx, |ui, _| {
         menu::label(ui, "Adaptive resonance");
 
+        let mode = res.mode.value();
+        let spectral = enabled && mode == ResMode::Spectral;
+
+        // --- mode: off, or one of the two detection engines --------------
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            let current = if !enabled {
+                0
+            } else if mode == ResMode::Adaptive {
+                1
+            } else {
+                2
+            };
+            if let Some(i) = chrome::segmented(
+                ui,
+                &["Off", "Adaptive", "Spectral"],
+                current,
+                theme::NEON,
+                62.0,
+                24.0,
+                FontId::proportional(theme::TINY),
+            ) {
+                match i {
+                    0 => edit::set_bool(frame.setter, &res.enabled, false),
+                    _ => {
+                        if !enabled {
+                            edit::set_bool(frame.setter, &res.enabled, true);
+                        }
+                        edit::set_enum(
+                            frame.setter,
+                            &res.mode,
+                            if i == 1 { ResMode::Adaptive } else { ResMode::Spectral },
+                        );
+                    }
+                }
+            }
+        });
+        ui.add_space(4.0);
+
         let knob = |ui: &mut Ui,
                     label: &str,
                     value: f32,
@@ -157,17 +197,17 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
         ui.horizontal(|ui| {
             ui.add_space(14.0);
             ui.spacing_mut().item_spacing.x = 4.0;
-            if let Some(v) = knob(ui, "Depth", res.depth.value() * 100.0, 0.0, 100.0, 50.0, false, &percent) {
+            if let Some(v) = knob(ui, "Amount", res.depth.value() * 100.0, 0.0, 100.0, 50.0, false, &percent) {
                 edit::set_float(frame.setter, &res.depth, v / 100.0);
             }
-            if let Some(v) = knob(ui, "Sharp", res.sharpness.value() * 100.0, 0.0, 100.0, 50.0, false, &percent) {
+            if let Some(v) = knob(ui, "Select", res.sharpness.value() * 100.0, 0.0, 100.0, 50.0, false, &percent) {
                 edit::set_float(frame.setter, &res.sharpness, v / 100.0);
             }
-            if let Some(v) = knob(ui, "Thresh", res.threshold.value(), -12.0, 24.0, 6.0, false, &plain) {
+            if let Some(v) = knob(ui, "Sens", res.threshold.value(), -12.0, 24.0, 6.0, false, &plain) {
                 edit::set_float(frame.setter, &res.threshold, v);
             }
-            if let Some(v) = knob(ui, "Mix", res.mix.value() * 100.0, 0.0, 100.0, 100.0, false, &percent) {
-                edit::set_float(frame.setter, &res.mix, v / 100.0);
+            if let Some(v) = knob(ui, "Range", res.range.value(), 0.0, 36.0, 36.0, false, &plain) {
+                edit::set_float(frame.setter, &res.range, v);
             }
         });
         ui.horizontal(|ui| {
@@ -187,11 +227,65 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
             }
         });
 
+        // --- the spectral engine's filter budget, and the stage mix -------
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if let Some(v) = knob(ui, "Mix", res.mix.value() * 100.0, 0.0, 100.0, 100.0, false, &percent) {
+                edit::set_float(frame.setter, &res.mix, v / 100.0);
+            }
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                chrome::caption(ui, "Quality");
+                let quality = res.quality.value();
+                let current = match quality {
+                    ResQuality::Ultra => 0,
+                    ResQuality::Balanced => 1,
+                    ResQuality::High => 2,
+                };
+                // The budget belongs to the spectral engine; it stays visible
+                // but inert while the bank is doing the finding.
+                let seg = ui.scope(|ui| {
+                    if !spectral {
+                        ui.disable();
+                    }
+                    ui.set_opacity(if spectral { 1.0 } else { 0.4 });
+                    chrome::segmented(
+                        ui,
+                        &["Ultra", "Bal", "High"],
+                        current,
+                        theme::NEON,
+                        44.0,
+                        22.0,
+                        FontId::proportional(theme::TINY),
+                    )
+                });
+                if let Some(i) = seg.inner {
+                    edit::set_enum(
+                        frame.setter,
+                        &res.quality,
+                        match i {
+                            0 => ResQuality::Ultra,
+                            1 => ResQuality::Balanced,
+                            _ => ResQuality::High,
+                        },
+                    );
+                }
+                ui.label(
+                    nih_plug_egui::egui::RichText::new("8 / 16 / 24 filters")
+                        .font(theme::caption())
+                        .color(white(64)),
+                );
+            });
+        });
+
         ui.add_space(4.0);
         let delta = res.delta.value();
-        let width = ui.available_width() - 8.0;
+        let width = ui.available_width() - 32.0;
         ui.horizontal(|ui| {
-            ui.add_space(4.0);
+            ui.add_space(16.0);
             let response = chrome::pill_sized(
                 ui,
                 "Listen to what's removed",
@@ -203,18 +297,29 @@ fn pair(ui: &mut Ui, frame: &Frame, fx: &Arc<FxRenderer>) {
             }
         });
 
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(6.0);
-            ui.label(
-                nih_plug_egui::egui::RichText::new(
-                    "Cuts only what stands proud of the spectrum around it, so a sloped mix \
-                     passes through and a ringing peak does not. Zero latency.",
-                )
-                .font(FontId::proportional(theme::TINY))
-                .color(white(90)),
-            );
+        ui.add_space(5.0);
+        // The description wraps inside its own padded column — a bare
+        // wrapped label falls back to the panel's left edge on every row
+        // after the first.
+        ui.horizontal(|ui| {
+            ui.add_space(16.0);
+            ui.vertical(|ui| {
+                ui.set_max_width(268.0);
+                ui.label(
+                    nih_plug_egui::egui::RichText::new(if spectral {
+                        "An FFT watches the signal from a background thread and aims \
+                         tracking notch filters at what rings. The audio itself never \
+                         waits for it and is never delayed. Zero latency."
+                    } else {
+                        "Cuts only what stands proud of the spectrum around it, so a sloped \
+                         mix passes through and a ringing peak does not. Zero latency."
+                    })
+                    .font(FontId::proportional(theme::TINY))
+                    .color(white(90)),
+                );
+            });
         });
+        ui.add_space(6.0);
     });
 }
 

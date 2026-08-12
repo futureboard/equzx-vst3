@@ -170,7 +170,6 @@ impl Display {
         selected: &mut Option<usize>,
     ) {
         let bypassed = frame.params.bypass.value();
-        self.rebuild(bands, frame, ui_state, bypassed);
 
         let plot = Rect::from_min_max(
             pos2(rect.min.x + PAD_LEFT, rect.min.y + PAD_TOP),
@@ -179,6 +178,23 @@ impl Display {
         if plot.width() < 20.0 || plot.height() < 20.0 {
             return;
         }
+
+        // Sample the curves in screen space: one evaluation per physical
+        // pixel column, whatever the window size and DPI, so a stroke segment
+        // is never longer than a pixel and the curves stay smooth.
+        let ppp = ui.ctx().pixels_per_point();
+        let segments = ((plot.width() * ppp).round() as usize).clamp(256, 4096);
+        self.grid.set_resolution(segments);
+        if self.static_total.len() != self.grid.len() {
+            let n = self.grid.len();
+            self.static_total = vec![0.0; n];
+            self.total = vec![0.0; n];
+            self.band_curve = vec![0.0; n];
+            // The cached band curves were evaluated on the old grid.
+            self.cached_for = None;
+        }
+
+        self.rebuild(bands, frame, ui_state, bypassed);
         let axes = Axes {
             plot,
             db_range: ui_state.db_range,
@@ -214,6 +230,21 @@ impl Display {
                 );
             }
 
+            // Resonance layers sit between the spectrum and the EQ response —
+            // detection highlights, then live attenuation — so whatever the
+            // suppressors are doing, the EQ curve stays on top of it.
+            if !bypassed {
+                if frame.resonance.iter().any(|c| *c > 0.05) {
+                    draw_resonance(&clipped, &axes, frame.resonance);
+                }
+                draw_res_targets(
+                    &clipped,
+                    &axes,
+                    frame.res_targets,
+                    ui.ctx().pointer_hover_pos().filter(|p| plot.contains(*p)),
+                );
+            }
+
             let focus = self.hovered.or(*selected);
             self.draw_curves(&clipped, &axes, bands, frame, bypassed, focus);
         }
@@ -232,10 +263,6 @@ impl Display {
                     levels: 3,
                 },
             ));
-        }
-
-        if !bypassed && frame.params.resonance.enabled.value() {
-            draw_resonance(&ui.painter().with_clip_rect(plot), &axes, frame.resonance);
         }
 
         self.interact(ui, &axes, &background, frame, bands, ui_state, selected);
@@ -859,11 +886,14 @@ fn draw_spectrum(
     layer: SpectrumLayer,
 ) {
     let hold_peaks = layer == SpectrumLayer::Pre;
-    let columns = axes.plot.width().round().max(2.0) as usize;
+    // One column per physical pixel — the trace is sampled in screen space,
+    // so it stays exactly as fine as the display it is drawn on.
+    let ppp = painter.ctx().pixels_per_point();
+    let columns = (((axes.plot.width() * ppp).round()).max(2.0) as usize).min(4096);
     let left = axes.plot.min.x;
-    let width = axes.plot.width();
-    let freq_at = |column: f32| {
-        let t = (column / width).clamp(0.0, 1.0);
+    let step = axes.plot.width() / (columns - 1).max(1) as f32;
+    let freq_at = move |column: f32| {
+        let t = (column / (columns - 1).max(1) as f32).clamp(0.0, 1.0);
         F_MIN * (F_MAX / F_MIN).powf(t)
     };
 
@@ -881,7 +911,7 @@ fn draw_spectrum(
     let trace: Vec<Pos2> = curve
         .iter()
         .enumerate()
-        .map(|(i, db)| pos2(left + i as f32, to_y(*db)))
+        .map(|(i, db)| pos2(left + i as f32 * step, to_y(*db)))
         .collect();
     if trace.len() < 2 {
         return;
@@ -900,7 +930,7 @@ fn draw_spectrum(
                 points: trace,
                 closed: false,
                 fill: Color32::TRANSPARENT,
-                stroke: PathStroke::new(1.0, Color32::from_rgba_unmultiplied(186, 182, 198, 110)),
+                stroke: PathStroke::new(1.2, Color32::from_rgba_unmultiplied(186, 182, 198, 110)),
             }));
         }
         SpectrumLayer::Post => {
@@ -918,7 +948,7 @@ fn draw_spectrum(
             for (width, color) in [
                 (6.0, fade(SPECTRUM_ROSE, 0.10 * glow)),
                 (2.6, fade(SPECTRUM_ROSE, 0.30 * glow)),
-                (1.1, fade(SPECTRUM_PEAK, 0.88)),
+                (1.3, fade(SPECTRUM_PEAK, 0.88)),
             ] {
                 painter.add(Shape::Path(PathShape {
                     points: trace.clone(),
@@ -936,7 +966,7 @@ fn draw_spectrum(
             .iter()
             .take(columns)
             .enumerate()
-            .map(|(i, db)| pos2(left + i as f32, to_y(*db)))
+            .map(|(i, db)| pos2(left + i as f32 * step, to_y(*db)))
             .collect();
         if peaks.len() >= 2 {
             painter.add(Shape::Path(PathShape {
@@ -1041,6 +1071,115 @@ fn draw_resonance(painter: &nih_plug_egui::egui::Painter, axes: &Axes, reduction
     }));
 }
 
+/// The spectral engine's targets, drawn small on purpose.
+///
+/// A candidate the detector is still weighing is a pale tick along the top of
+/// the plot; a target being cut hangs a thin indicator from the zero line down
+/// to its depth on the plot's own dB scale. Emphasis goes only to the hovered
+/// target and the few deepest cuts — the EQ nodes stay the loudest thing on
+/// the graph, and two dozen filters must never read as two dozen handles.
+fn draw_res_targets(
+    painter: &nih_plug_egui::egui::Painter,
+    axes: &Axes,
+    targets: &[crate::dsp::spectral::TargetView],
+    hover: Option<Pos2>,
+) {
+    let zero = axes.y(0.0);
+
+    // The third-deepest active cut marks the emphasis line.
+    let mut top = [0.0f32; 3];
+    for t in targets.iter().filter(|t| t.is_some() && t.is_active()) {
+        if t.cut_db > top[0] {
+            top = [t.cut_db, top[0], top[1]];
+        } else if t.cut_db > top[1] {
+            top = [top[0], t.cut_db, top[1]];
+        } else if t.cut_db > top[2] {
+            top[2] = t.cut_db;
+        }
+    }
+    let emphasis_above = top[2];
+
+    // Nearest target to the pointer, by screen distance in x.
+    let hovered = hover.and_then(|p| {
+        targets
+            .iter()
+            .filter(|t| t.is_some() && (F_MIN..=F_MAX).contains(&t.freq))
+            .map(|t| (t, (axes.x(t.freq) - p.x).abs()))
+            .filter(|(_, d)| *d < 8.0)
+            .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(t, _)| *t)
+    });
+
+    for t in targets.iter() {
+        if !t.is_some() || !(F_MIN..=F_MAX).contains(&t.freq) {
+            continue;
+        }
+        let x = axes.x(t.freq);
+        let is_hovered = hovered.is_some_and(|h| (h.freq - t.freq).abs() < f32::EPSILON);
+
+        if t.is_active() {
+            let strong = is_hovered || t.cut_db >= emphasis_above;
+            let alpha = if strong { 0.9 } else { 0.45 };
+            let tip = axes.y(-t.cut_db);
+            painter.line_segment(
+                [pos2(x, zero), pos2(x, tip)],
+                Stroke::new(if strong { 1.6 } else { 1.1 }, fade(NEON, alpha)),
+            );
+            // A small downward arrowhead at the depth the filter has reached.
+            painter.add(Shape::convex_polygon(
+                vec![
+                    pos2(x - 2.5, tip - 3.0),
+                    pos2(x + 2.5, tip - 3.0),
+                    pos2(x, tip + 1.5),
+                ],
+                fade(NEON, alpha),
+                Stroke::NONE,
+            ));
+        } else if t.confidence > 0.15 {
+            // Detected, not yet trusted enough to cut: a quiet mark, brighter
+            // as confidence builds.
+            painter.circle_filled(
+                pos2(x, axes.plot.min.y + 8.0),
+                1.5,
+                fade(NEON, 0.12 + 0.3 * t.confidence.min(1.0)),
+            );
+        }
+
+        if is_hovered {
+            let label = if t.is_active() {
+                format!(
+                    "{} · −{:.1} dB · Q {:.0}",
+                    fmt_freq(t.freq),
+                    t.cut_db,
+                    t.q
+                )
+            } else {
+                format!(
+                    "{} · {:.0}% sure",
+                    fmt_freq(t.freq),
+                    t.confidence.min(1.0) * 100.0
+                )
+            };
+            // Kept inside the plot whichever side of it the target sits.
+            let at_right = x > axes.plot.center().x;
+            painter.text(
+                pos2(
+                    x + if at_right { -6.0 } else { 6.0 },
+                    axes.plot.min.y + 18.0,
+                ),
+                if at_right {
+                    Align2::RIGHT_CENTER
+                } else {
+                    Align2::LEFT_CENTER
+                },
+                label,
+                theme::caption(),
+                white(200),
+            );
+        }
+    }
+}
+
 fn stroke_band(
     painter: &nih_plug_egui::egui::Painter,
     grid: &ResponseGrid,
@@ -1070,7 +1209,9 @@ fn stroke_band(
         closed: false,
         fill: Color32::TRANSPARENT,
         stroke: PathStroke::new(
-            if focused { 1.5 } else { 1.0 },
+            // A hair over a pixel: sub-pixel strokes leave the feather doing
+            // all the work and read as broken; this stays crisp but solid.
+            if focused { 1.5 } else { 1.2 },
             fade(color, if focused { 0.85 } else { 0.28 }),
         ),
     }));

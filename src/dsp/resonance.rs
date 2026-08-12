@@ -131,6 +131,9 @@ pub struct ResonanceSettings {
     /// Frequency range the stage works over, faded in over an octave at each end.
     pub low_hz: f32,
     pub high_hz: f32,
+    /// Ceiling on the global stage's cut, in dB. The bank's own
+    /// [`RES_MAX_CUT_DB`] still applies on top.
+    pub range_db: f32,
     /// 0..1 blend between the signal as it arrived and the suppressed one.
     pub mix: f32,
     /// Monitor what is being removed instead of what is being kept.
@@ -148,9 +151,52 @@ impl Default for ResonanceSettings {
             release_ms: 40.0,
             low_hz: RES_F_LO,
             high_hz: 20_000.0,
+            range_db: RES_MAX_CUT_DB,
             mix: 1.0,
             delta: false,
         }
+    }
+}
+
+/// What the EQ's own bands are asking of the bank, per bank band.
+///
+/// Each array is the per-band parameters spread over the bank through
+/// [`band_region_weight`] and blended where regions overlap. `depth` is the
+/// gate for the rest: where it is zero the other arrays are ignored, so
+/// callers with nothing to ask can pass [`BandOverlays::none`].
+pub struct BandOverlays {
+    /// Suppression amount, 0..1 per bank band. Adds to the global depth.
+    pub depth: [f32; RES_BANDS],
+    /// Ceiling on the cut these bands may ask for, in dB.
+    pub cap_db: [f32; RES_BANDS],
+    /// dB taken off the detection threshold inside the bands' regions.
+    pub sens_db: [f32; RES_BANDS],
+    /// Ballistics for the bands' share of the cut. Zero means "use global".
+    pub attack_ms: [f32; RES_BANDS],
+    pub release_ms: [f32; RES_BANDS],
+}
+
+impl BandOverlays {
+    pub const fn none() -> Self {
+        Self {
+            depth: [0.0; RES_BANDS],
+            cap_db: [0.0; RES_BANDS],
+            sens_db: [0.0; RES_BANDS],
+            attack_ms: [0.0; RES_BANDS],
+            release_ms: [0.0; RES_BANDS],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.depth = [0.0; RES_BANDS];
+        self.cap_db = [0.0; RES_BANDS];
+        self.sens_db = [0.0; RES_BANDS];
+        self.attack_ms = [0.0; RES_BANDS];
+        self.release_ms = [0.0; RES_BANDS];
+    }
+
+    pub fn any(&self) -> bool {
+        self.depth.iter().any(|d| *d > 0.0)
     }
 }
 
@@ -231,6 +277,9 @@ pub struct ResonanceBank {
     reference_db: [f32; RES_BANDS],
     /// Where each band's reduction is heading, before ballistics.
     target_db: [f32; RES_BANDS],
+    /// This block's blended ballistics, per band — see [`Self::plan`].
+    tau_attack: [f32; RES_BANDS],
+    tau_release: [f32; RES_BANDS],
     /// And where it has got to, in dB of cut — positive.
     reduction_db: [f32; RES_BANDS],
     /// What was actually asked of the filter, after the overlap correction.
@@ -276,6 +325,8 @@ impl ResonanceBank {
             padded: [-120.0; RES_BANDS + 2 * MAX_KERNEL_RADIUS],
             reference_db: [-120.0; RES_BANDS],
             target_db: [0.0; RES_BANDS],
+            tau_attack: [5.0; RES_BANDS],
+            tau_release: [40.0; RES_BANDS],
             reduction_db: [0.0; RES_BANDS],
             applied_db: [0.0; RES_BANDS],
             cut_coeffs: [Coeffs::identity(); RES_BANDS],
@@ -350,7 +401,7 @@ impl ResonanceBank {
 
     /// Process one control block in place. `right` is `None` on mono.
     ///
-    /// `band_depth` is what the EQ's own bands are asking for, per bank band —
+    /// `overlays` is what the EQ's own bands are asking for, per bank band —
     /// see [`band_region_weight`]. It stands on its own: a band with a resonance
     /// amount works whether or not the global stage is switched on, and is not
     /// subject to the global frequency range, which would otherwise let a
@@ -360,13 +411,13 @@ impl ResonanceBank {
         left: &mut [f32],
         right: Option<&mut [f32]>,
         s: &ResonanceSettings,
-        band_depth: &[f32],
+        overlays: &BandOverlays,
     ) {
         let n = left.len().min(CONTROL_BLOCK);
         if n == 0 {
             return;
         }
-        if !s.enabled && !band_depth.iter().any(|d| *d > 0.0) {
+        if !s.enabled && !overlays.any() {
             // Coming back on with a bank full of state that describes whatever
             // was playing before the bypass is a burst of stale suppression.
             if self.peak_reduction() != 0.0 || self.idle.iter().any(|i| *i < IDLE_BLOCKS) {
@@ -399,7 +450,7 @@ impl ResonanceBank {
 
         self.measure(n);
         self.build_reference(s.sharpness);
-        self.plan(s, band_depth, dt);
+        self.plan(s, overlays, dt);
     }
 
     /// Step 1 — every band's level, through its bandpass.
@@ -480,30 +531,68 @@ impl ResonanceBank {
     }
 
     /// Step 3 — excess, ballistics, and the correction for overlapping filters.
-    fn plan(&mut self, s: &ResonanceSettings, band_depth: &[f32], dt: f32) {
+    fn plan(&mut self, s: &ResonanceSettings, o: &BandOverlays, dt: f32) {
         let global = if s.enabled { s.depth.max(0.0) } else { 0.0 };
         for i in 0..self.live {
             // The global stage works across its own frequency range; a band's
             // own amount works across the band, and adds to it.
-            let depth = (global * range_weight(self.freqs[i], s.low_hz, s.high_hz)
-                + band_depth.get(i).copied().unwrap_or(0.0).max(0.0))
-            .min(1.0);
+            let g = global * range_weight(self.freqs[i], s.low_hz, s.high_hz);
+            let b = o.depth[i].max(0.0);
+            let depth = (g + b).min(1.0);
 
-            let excess = self.levels_db[i] - self.reference_db[i] - s.threshold_db;
+            // Each contributor brings its own ceiling; where both act, the
+            // more generous one wins — two callers pointed at the same peak
+            // both wanting it gone is not a reason to cut it less.
+            let cap = RES_MAX_CUT_DB
+                .min((if g > 0.0 { s.range_db } else { 0.0 }).max(if b > 0.0 {
+                    o.cap_db[i]
+                } else {
+                    0.0
+                }));
+
+            // A band's sensitivity lowers the threshold inside its region.
+            let threshold = s.threshold_db - if b > 0.0 { o.sens_db[i] } else { 0.0 };
+
+            let excess = self.levels_db[i] - self.reference_db[i] - threshold;
             let audible = self.levels_db[i] > RES_FLOOR_DB;
             let want = if excess > 0.0 && audible {
                 excess * depth
             } else {
                 0.0
             };
-            self.target_db[i] = want.min(RES_MAX_CUT_DB);
+            self.target_db[i] = want.min(cap.max(0.0));
+
+            // Ballistics blended by who is asking: a bank band driven mostly
+            // by one EQ band's amount moves at that band's attack, one driven
+            // by the global stage at the global attack, and a mix in between.
+            let total = g + b;
+            let (attack, release) = if total <= 0.0 || b <= 0.0 {
+                (s.attack_ms, s.release_ms)
+            } else {
+                let ba = if o.attack_ms[i] > 0.0 {
+                    o.attack_ms[i]
+                } else {
+                    s.attack_ms
+                };
+                let br = if o.release_ms[i] > 0.0 {
+                    o.release_ms[i]
+                } else {
+                    s.release_ms
+                };
+                (
+                    (g * s.attack_ms + b * ba) / total,
+                    (g * s.release_ms + b * br) / total,
+                )
+            };
+            self.tau_attack[i] = attack;
+            self.tau_release[i] = release;
         }
 
         for i in 0..self.live {
             let tau = if self.target_db[i] > self.reduction_db[i] {
-                s.attack_ms
+                self.tau_attack[i]
             } else {
-                s.release_ms
+                self.tau_release[i]
             };
             self.reduction_db[i] = step_toward(self.reduction_db[i], self.target_db[i], tau, dt);
         }
@@ -597,14 +686,14 @@ impl ResonanceBank {
 }
 
 /// Replace the suppressed signal with what was taken out of it.
-fn subtract(wet: &mut [f32], dry: &[f32]) {
+pub fn subtract(wet: &mut [f32], dry: &[f32]) {
     for (out, dry) in wet.iter_mut().zip(dry) {
         *out = dry - *out;
     }
 }
 
 /// Fade the suppressed signal back toward the one that arrived.
-fn crossfade(wet: &mut [f32], dry: &[f32], mix: f32) {
+pub fn crossfade(wet: &mut [f32], dry: &[f32], mix: f32) {
     for (out, dry) in wet.iter_mut().zip(dry) {
         *out = dry + (*out - dry) * mix;
     }
@@ -634,7 +723,19 @@ mod tests {
 
     const SR: f32 = 48_000.0;
     /// No EQ band is asking for anything of its own.
-    const NONE: [f32; RES_BANDS] = [0.0; RES_BANDS];
+    const NONE: BandOverlays = BandOverlays::none();
+
+    /// Overlays with the given depths and everything else at the values the
+    /// engine would fill in for a default band.
+    fn overlays_with_depth(depth: [f32; RES_BANDS]) -> BandOverlays {
+        BandOverlays {
+            depth,
+            cap_db: [RES_MAX_CUT_DB; RES_BANDS],
+            sens_db: [0.0; RES_BANDS],
+            attack_ms: [0.0; RES_BANDS],
+            release_ms: [0.0; RES_BANDS],
+        }
+    }
 
     fn on() -> ResonanceSettings {
         ResonanceSettings {
@@ -672,7 +773,7 @@ mod tests {
     fn run_with(
         bank: &mut ResonanceBank,
         s: &ResonanceSettings,
-        band_depth: &[f32],
+        band_depth: &BandOverlays,
         blocks: usize,
         mut gen: impl FnMut(usize) -> f32,
     ) -> (f32, f32) {
@@ -914,6 +1015,7 @@ mod tests {
                 *slot = 1.0;
             }
         }
+        let depth = overlays_with_depth(depth);
 
         let mut bank = ResonanceBank::new(SR);
         let (dry, wet) = run_with(&mut bank, &off, &depth, 600, sine(1000.0));
@@ -934,10 +1036,11 @@ mod tests {
     fn a_band_amount_stays_inside_its_own_region() {
         let off = ResonanceSettings::default();
         // A bell at 200 Hz, asking for everything it can get.
-        let mut depth = [0.0f32; RES_BANDS];
-        for (i, slot) in depth.iter_mut().enumerate() {
+        let mut raw = [0.0f32; RES_BANDS];
+        for (i, slot) in raw.iter_mut().enumerate() {
             *slot = band_region_weight(BandKind::Bell, 200.0, 2.0, band_freq(i));
         }
+        let depth = overlays_with_depth(raw);
 
         // A tone two and a half octaves above it is outside that region.
         let mut bank = ResonanceBank::new(SR);

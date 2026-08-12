@@ -23,21 +23,27 @@ use crate::params::BandKind;
 pub const F_MIN: f32 = 20.0;
 pub const F_MAX: f32 = 22_000.0;
 
-/// Segments across the axis. One more point than this is evaluated.
-///
-/// Fine enough that a segment is shorter than a pixel and a half at the
-/// default window: a steep bell drawn with the wide translucent glow strokes
-/// shows every kink, and 480 was visibly polygonal at the apex.
+/// Segments across the axis before the display measures itself — the display
+/// re-grids to one evaluation per physical pixel column on its first frame
+/// (see [`ResponseGrid::set_resolution`]). One more point than this is
+/// evaluated.
 pub const CURVE_POINTS: usize = 960;
 
 /// The frequencies a curve is evaluated at, with the per-frequency terms of
 /// `|H(e^jw)|` already worked out.
+///
+/// The trig tables and the evaluation are f64 on purpose. At the low end of
+/// the axis `cos ω` sits within 1e-5 of 1.0, and the magnitude formula
+/// cancels terms of size 2 down to that residue — in f32 that leaves a few
+/// percent of noise per section, and a steep cut cascades eight sections, so
+/// the drawn curve wobbled by whole pixels. In f64 the cancellation keeps
+/// twelve clean digits and the curve is exact to far below a pixel.
 pub struct ResponseGrid {
     freqs: Vec<f32>,
-    cos_w: Vec<f32>,
-    sin_w: Vec<f32>,
-    cos_2w: Vec<f32>,
-    sin_2w: Vec<f32>,
+    cos_w: Vec<f64>,
+    sin_w: Vec<f64>,
+    cos_2w: Vec<f64>,
+    sin_2w: Vec<f64>,
     sample_rate: f32,
 }
 
@@ -64,7 +70,7 @@ impl ResponseGrid {
         }
         self.sample_rate = sample_rate;
         for i in 0..self.freqs.len() {
-            let w = 2.0 * std::f32::consts::PI * self.freqs[i] / sample_rate;
+            let w = 2.0 * std::f64::consts::PI * self.freqs[i] as f64 / sample_rate as f64;
             let (s, c) = w.sin_cos();
             let (s2, c2) = (2.0 * w).sin_cos();
             self.sin_w[i] = s;
@@ -72,6 +78,29 @@ impl ResponseGrid {
             self.sin_2w[i] = s2;
             self.cos_2w[i] = c2;
         }
+    }
+
+    /// Re-grid to `segments` across the axis — how the display keeps one
+    /// evaluation per physical pixel column whatever the window size and DPI.
+    ///
+    /// A no-op at the resolution it already has; a rebuild otherwise, which
+    /// only happens while the window is actually resizing.
+    pub fn set_resolution(&mut self, segments: usize) {
+        let segments = segments.max(16);
+        let n = segments + 1;
+        if self.freqs.len() == n {
+            return;
+        }
+        self.freqs = (0..n)
+            .map(|i| F_MIN * (F_MAX / F_MIN).powf(i as f32 / segments as f32))
+            .collect();
+        self.cos_w = vec![0.0; n];
+        self.sin_w = vec![0.0; n];
+        self.cos_2w = vec![0.0; n];
+        self.sin_2w = vec![0.0; n];
+        let rate = self.sample_rate;
+        self.sample_rate = 0.0;
+        self.set_sample_rate(rate);
     }
 
     pub fn sample_rate(&self) -> f32 {
@@ -95,14 +124,16 @@ impl ResponseGrid {
     }
 
     /// `|H(e^jw)|` of one section at grid point `i`.
-    pub fn magnitude(&self, c: &Coeffs, i: usize) -> f32 {
+    pub fn magnitude(&self, c: &Coeffs, i: usize) -> f64 {
         let (cw, sw) = (self.cos_w[i], self.sin_w[i]);
         let (c2w, s2w) = (self.cos_2w[i], self.sin_2w[i]);
+        let (b0, b1, b2) = (c.b0 as f64, c.b1 as f64, c.b2 as f64);
+        let (a1, a2) = (c.a1 as f64, c.a2 as f64);
 
-        let num_re = c.b0 + c.b1 * cw + c.b2 * c2w;
-        let num_im = -(c.b1 * sw + c.b2 * s2w);
-        let den_re = 1.0 + c.a1 * cw + c.a2 * c2w;
-        let den_im = -(c.a1 * sw + c.a2 * s2w);
+        let num_re = b0 + b1 * cw + b2 * c2w;
+        let num_im = -(b1 * sw + b2 * s2w);
+        let den_re = 1.0 + a1 * cw + a2 * c2w;
+        let den_im = -(a1 * sw + a2 * s2w);
 
         let den = den_re.hypot(den_im);
         if den == 0.0 {
@@ -114,11 +145,11 @@ impl ResponseGrid {
 
     /// Combined response of a cascade at grid point `i`, in dB.
     pub fn db_at(&self, sections: &[Coeffs], i: usize) -> f32 {
-        let mut mag = 1.0;
+        let mut mag = 1.0f64;
         for section in sections {
             mag *= self.magnitude(section, i);
         }
-        20.0 * mag.max(1e-7).log10()
+        (20.0 * mag.max(1e-9).log10()) as f32
     }
 
     /// The whole cascade, written into `out`.
@@ -191,6 +222,12 @@ mod tests {
             attack: 20.0,
             release: 200.0,
             resonance: 0.0,
+            res_mode: crate::params::BandResMode::Adaptive,
+            res_range: 36.0,
+            res_sens: 0.0,
+            res_width: 1.0,
+            res_attack: 5.0,
+            res_release: 40.0,
         }
     }
 
@@ -205,7 +242,7 @@ mod tests {
         let grid = ResponseGrid::new(SR);
         let c = Coeffs::peaking(1000.0, 1.0, 6.0, SR);
         for i in (0..grid.len()).step_by(37) {
-            let direct = c.magnitude(grid.freq(i), SR);
+            let direct = c.magnitude(grid.freq(i), SR) as f64;
             let cached = grid.magnitude(&c, i);
             assert!(
                 (direct - cached).abs() < 1e-4,

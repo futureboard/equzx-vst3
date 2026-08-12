@@ -12,11 +12,12 @@ use std::sync::Arc;
 
 use nih_plug::prelude::*;
 
+use crate::dsp::spectral::TargetView;
 use crate::gui::gpu::FxRenderer;
 use crate::gui::state::{BandSnapshot, ChannelView, Snapshot};
 use crate::params::{
-    BandChannel, BandKind, BandParams, DynMode, EquzxParams, ResonanceParams, Slope, TransientState,
-    MAX_BANDS,
+    BandChannel, BandKind, BandParams, BandResMode, DynMode, EquzxParams, ResonanceParams, Slope,
+    TransientState, MAX_BANDS,
 };
 
 /// Everything one frame of the UI can see and do.
@@ -32,6 +33,8 @@ pub struct Frame<'a> {
     pub resonance: &'a [f32],
     /// The deepest cut anywhere in the bank.
     pub resonance_peak: f32,
+    /// The spectral pool's targets — candidates and active cuts alike.
+    pub res_targets: &'a [TargetView],
     pub spectrum_pre: &'a [f32],
     pub spectrum_post: &'a [f32],
     pub sample_rate: f32,
@@ -111,6 +114,13 @@ pub fn set_band_resonance(frame: &Frame, slot: usize, percent: f32) {
     }
 }
 
+band_setter!(set_band_res_mode, res_mode, set_enum, BandResMode);
+band_setter!(set_band_res_range, res_range, set_float, f32);
+band_setter!(set_band_res_sens, res_sens, set_float, f32);
+band_setter!(set_band_res_width, res_width, set_float, f32);
+band_setter!(set_band_res_attack, res_attack, set_float, f32);
+band_setter!(set_band_res_release, res_release, set_float, f32);
+
 /// Move a cut band's slope by one step of the list.
 pub fn step_slope(frame: &Frame, slot: usize, direction: i32) {
     let Some(band) = frame.band(slot) else {
@@ -170,6 +180,12 @@ pub fn reset_band(setter: &ParamSetter, band: &BandParams) {
     set_float(setter, &band.attack, band.attack.default_plain_value());
     set_float(setter, &band.release, band.release.default_plain_value());
     set_float(setter, &band.resonance, band.resonance.default_plain_value());
+    set_enum(setter, &band.res_mode, band.res_mode.default_plain_value());
+    set_float(setter, &band.res_range, band.res_range.default_plain_value());
+    set_float(setter, &band.res_sens, band.res_sens.default_plain_value());
+    set_float(setter, &band.res_width, band.res_width.default_plain_value());
+    set_float(setter, &band.res_attack, band.res_attack.default_plain_value());
+    set_float(setter, &band.res_release, band.res_release.default_plain_value());
     set_bool(setter, &band.dynamic, band.dynamic.default_plain_value());
 }
 
@@ -186,6 +202,12 @@ fn write_band(setter: &ParamSetter, band: &BandParams, snapshot: &BandSnapshot) 
     set_float(setter, &band.attack, snapshot.attack);
     set_float(setter, &band.release, snapshot.release);
     set_float(setter, &band.resonance, snapshot.resonance / 100.0);
+    set_enum(setter, &band.res_mode, snapshot.res_mode);
+    set_float(setter, &band.res_range, snapshot.res_range);
+    set_float(setter, &band.res_sens, snapshot.res_sens);
+    set_float(setter, &band.res_width, snapshot.res_width);
+    set_float(setter, &band.res_attack, snapshot.res_attack);
+    set_float(setter, &band.res_release, snapshot.res_release);
     set_bool(setter, &band.enabled, snapshot.enabled);
     set_bool(setter, &band.dynamic, snapshot.dynamic);
 }
@@ -195,6 +217,9 @@ fn write_band(setter: &ParamSetter, band: &BandParams, snapshot: &BandSnapshot) 
 /// Apply the resonance stage from a snapshot. Percentages in, ratios out.
 pub fn write_resonance(setter: &ParamSetter, p: &ResonanceParams, snapshot: &crate::gui::state::ResonanceSnapshot) {
     set_bool(setter, &p.enabled, snapshot.enabled);
+    set_enum(setter, &p.mode, snapshot.mode);
+    set_enum(setter, &p.quality, snapshot.quality);
+    set_float(setter, &p.range, snapshot.range);
     set_float(setter, &p.depth, snapshot.depth / 100.0);
     set_float(setter, &p.sharpness, snapshot.sharpness / 100.0);
     set_float(setter, &p.mix, snapshot.mix / 100.0);

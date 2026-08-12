@@ -10,6 +10,7 @@ use nih_plug::prelude::AtomicF32;
 
 use crate::dsp::engine::BandMeter;
 use crate::dsp::resonance::RES_BANDS;
+use crate::dsp::spectral::{TargetView, MAX_TARGETS};
 use crate::params::MAX_BANDS;
 
 pub struct Meters {
@@ -21,6 +22,9 @@ pub struct Meters {
     resonance: Vec<AtomicF32>,
     /// The deepest of those, so the UI can show activity without the curve.
     resonance_peak: AtomicF32,
+    /// The spectral pool's targets: freq, cut, q, confidence per slot, with
+    /// freq 0 marking an empty one. Display-only, same relaxed discipline.
+    targets: Vec<[AtomicF32; 4]>,
 }
 
 impl Default for Meters {
@@ -30,6 +34,16 @@ impl Default for Meters {
             delta: (0..MAX_BANDS).map(|_| AtomicF32::new(0.0)).collect(),
             resonance: (0..RES_BANDS).map(|_| AtomicF32::new(0.0)).collect(),
             resonance_peak: AtomicF32::new(0.0),
+            targets: (0..MAX_TARGETS)
+                .map(|_| {
+                    [
+                        AtomicF32::new(0.0),
+                        AtomicF32::new(0.0),
+                        AtomicF32::new(0.0),
+                        AtomicF32::new(0.0),
+                    ]
+                })
+                .collect(),
         }
     }
 }
@@ -62,6 +76,26 @@ impl Meters {
         self.resonance_peak.load(Ordering::Relaxed)
     }
 
+    pub fn publish_targets(&self, views: &[TargetView]) {
+        for (slot, view) in self.targets.iter().zip(views.iter()) {
+            slot[0].store(view.freq, Ordering::Relaxed);
+            slot[1].store(view.cut_db, Ordering::Relaxed);
+            slot[2].store(view.q, Ordering::Relaxed);
+            slot[3].store(view.confidence, Ordering::Relaxed);
+        }
+    }
+
+    pub fn read_targets(&self, out: &mut [TargetView]) {
+        for (view, slot) in out.iter_mut().zip(self.targets.iter()) {
+            *view = TargetView {
+                freq: slot[0].load(Ordering::Relaxed),
+                cut_db: slot[1].load(Ordering::Relaxed),
+                q: slot[2].load(Ordering::Relaxed),
+                confidence: slot[3].load(Ordering::Relaxed),
+            };
+        }
+    }
+
     pub fn clear(&self) {
         for slot in 0..MAX_BANDS {
             self.level[slot].store(-100.0, Ordering::Relaxed);
@@ -71,6 +105,11 @@ impl Meters {
             self.resonance[slot].store(0.0, Ordering::Relaxed);
         }
         self.resonance_peak.store(0.0, Ordering::Relaxed);
+        for slot in self.targets.iter() {
+            for v in slot.iter() {
+                v.store(0.0, Ordering::Relaxed);
+            }
+        }
     }
 }
 
