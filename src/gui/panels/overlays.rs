@@ -37,10 +37,10 @@ pub fn analyzer(
     bands: &[BandView],
     selected: &mut Option<usize>,
 ) {
-    ui.spacing_mut().item_spacing.x = 6.0;
+    ui.spacing_mut().item_spacing.x = 4.0;
 
     let inverted = frame.params.phase_invert.value();
-    let phase = chrome::pill_upper(
+    let phase = chrome::pill_action(
         ui,
         "Phase",
         if inverted { Fill::Armed } else { Fill::Quiet },
@@ -50,10 +50,8 @@ pub fn analyzer(
     }
     phase.on_hover_text("Invert output polarity by 180 degrees");
 
-    chrome::divider(ui, 20.0);
-
     if let Some(band) = selected.and_then(|slot| bands.iter().find(|band| band.slot == slot)) {
-        let on = chrome::pill_upper(
+        let on = chrome::pill_action(
             ui,
             if band.enabled { "On" } else { "Off" },
             if band.enabled { Fill::Lit } else { Fill::Quiet },
@@ -64,7 +62,7 @@ pub fn analyzer(
         on.on_hover_text("Enable or bypass this band");
 
         let soloed = frame.transient.solo() == Some(band.slot);
-        let solo = chrome::pill_upper(
+        let solo = chrome::pill_action(
             ui,
             "Solo",
             if soloed {
@@ -80,15 +78,20 @@ pub fn analyzer(
         }
         solo.on_hover_text("Solo this band — or right-drag its handle on the display");
 
-        let del = chrome::pill_upper(ui, "Del", Fill::Quiet);
+        let del = chrome::pill_action(ui, "Del", Fill::Quiet);
         if del.clicked() {
             edit::remove_band(frame, band.slot);
             *selected = None;
         }
         del.on_hover_text("Delete this band");
 
-        chrome::divider(ui, 20.0);
     }
+
+    // One deliberate break separates selected-band actions from analyser
+    // configuration without making either group feel boxed in.
+    ui.add_space(8.0);
+    chrome::divider(ui, 18.0);
+    ui.add_space(4.0);
 
     let modes: Vec<&str> = AnalyzerMode::ALL.iter().map(|m| m.label()).collect();
     let selected = AnalyzerMode::ALL

@@ -502,7 +502,8 @@ fn dynamics_row(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
     if !on {
         row.disable();
     }
-    row.set_opacity(0.25 + 0.75 * lit);
+    // Disabled, but still legible enough to understand the signal topology.
+    row.set_opacity(0.40 + 0.60 * lit);
 
     let modes = ["above", "below"];
     let current = if band.dyn_mode == DynMode::Above { 0 } else { 1 };

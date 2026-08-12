@@ -82,16 +82,32 @@ pub fn fill_glass(
             StrokeKind::Inside,
         ),
     );
-    // A glass edge catches a brighter line than the border it sits in.
+    // A glass edge catches a brighter line than the border it sits in. The
+    // short left return and corner glint imply thickness without lifting the
+    // brightness of the whole plate.
     painter.set(
         slot.highlight,
-        nih_plug_egui::egui::Shape::line_segment(
-            [
-                Pos2::new(rect.min.x + radius * 0.6, rect.min.y + 1.0),
-                Pos2::new(rect.max.x - radius * 0.6, rect.min.y + 1.0),
-            ],
-            Stroke::new(1.0, white(34)),
-        ),
+        nih_plug_egui::egui::Shape::Vec(vec![
+            nih_plug_egui::egui::Shape::line_segment(
+                [
+                    Pos2::new(rect.min.x + radius * 0.55, rect.min.y + 1.0),
+                    Pos2::new(rect.max.x - radius * 0.6, rect.min.y + 1.0),
+                ],
+                Stroke::new(1.0, white(40)),
+            ),
+            nih_plug_egui::egui::Shape::line_segment(
+                [
+                    Pos2::new(rect.min.x + 1.0, rect.min.y + radius * 0.55),
+                    Pos2::new(rect.min.x + 1.0, rect.min.y + radius * 1.45),
+                ],
+                Stroke::new(1.0, white(28)),
+            ),
+            nih_plug_egui::egui::Shape::circle_filled(
+                Pos2::new(rect.min.x + radius * 0.34, rect.min.y + radius * 0.34),
+                1.15,
+                white(46),
+            ),
+        ]),
     );
 }
 
@@ -233,6 +249,24 @@ pub fn pill_upper(ui: &mut Ui, text: &str, fill: Fill) -> Response {
         None,
         PILL_HEIGHT,
         12.0,
+    )
+}
+
+/// A lighter action pill for dense overlay toolbars.
+pub fn pill_action(ui: &mut Ui, text: &str, fill: Fill) -> Response {
+    let spaced: String = text
+        .to_uppercase()
+        .chars()
+        .flat_map(|c| [c, '\u{2009}'])
+        .collect();
+    pill_impl(
+        ui,
+        spaced.trim_end(),
+        FontId::proportional(theme::TINY),
+        fill,
+        None,
+        29.0,
+        8.0,
     )
 }
 

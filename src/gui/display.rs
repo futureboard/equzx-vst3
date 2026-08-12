@@ -1086,18 +1086,22 @@ fn draw_res_targets(
 ) {
     let zero = axes.y(0.0);
 
-    // The third-deepest active cut marks the emphasis line.
-    let mut top = [0.0f32; 3];
-    for t in targets.iter().filter(|t| t.is_some() && t.is_active()) {
-        if t.cut_db > top[0] {
-            top = [t.cut_db, top[0], top[1]];
-        } else if t.cut_db > top[1] {
-            top = [top[0], t.cut_db, top[1]];
-        } else if t.cut_db > top[2] {
-            top[2] = t.cut_db;
-        }
-    }
-    let emphasis_above = top[2];
+    // Keep full arrows for the eight most convincing active targets. The rest
+    // remain visible as ticks, so a busy detector communicates density without
+    // turning the graph into a forest of arrows.
+    let mut strongest: Vec<usize> = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.is_some() && t.is_active())
+        .map(|(index, _)| index)
+        .collect();
+    strongest.sort_by(|a, b| {
+        let score = |i: usize| targets[i].cut_db * targets[i].confidence.clamp(0.1, 1.0);
+        score(*b)
+            .partial_cmp(&score(*a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    strongest.truncate(8);
 
     // Nearest target to the pointer, by screen distance in x.
     let hovered = hover.and_then(|p| {
@@ -1110,7 +1114,7 @@ fn draw_res_targets(
             .map(|(t, _)| *t)
     });
 
-    for t in targets.iter() {
+    for (index, t) in targets.iter().enumerate() {
         if !t.is_some() || !(F_MIN..=F_MAX).contains(&t.freq) {
             continue;
         }
@@ -1118,23 +1122,30 @@ fn draw_res_targets(
         let is_hovered = hovered.is_some_and(|h| (h.freq - t.freq).abs() < f32::EPSILON);
 
         if t.is_active() {
-            let strong = is_hovered || t.cut_db >= emphasis_above;
-            let alpha = if strong { 0.9 } else { 0.45 };
             let tip = axes.y(-t.cut_db);
-            painter.line_segment(
-                [pos2(x, zero), pos2(x, tip)],
-                Stroke::new(if strong { 1.6 } else { 1.1 }, fade(NEON, alpha)),
-            );
-            // A small downward arrowhead at the depth the filter has reached.
-            painter.add(Shape::convex_polygon(
-                vec![
-                    pos2(x - 2.5, tip - 3.0),
-                    pos2(x + 2.5, tip - 3.0),
-                    pos2(x, tip + 1.5),
-                ],
-                fade(NEON, alpha),
-                Stroke::NONE,
-            ));
+            if is_hovered || strongest.contains(&index) {
+                let confidence = t.confidence.clamp(0.0, 1.0);
+                let alpha = if is_hovered { 0.95 } else { 0.34 + 0.48 * confidence };
+                painter.line_segment(
+                    [pos2(x, zero), pos2(x, tip)],
+                    Stroke::new(if is_hovered { 1.6 } else { 1.15 }, fade(NEON, alpha)),
+                );
+                painter.add(Shape::convex_polygon(
+                    vec![
+                        pos2(x - 2.5, tip - 3.0),
+                        pos2(x + 2.5, tip - 3.0),
+                        pos2(x, tip + 1.5),
+                    ],
+                    fade(NEON, alpha),
+                    Stroke::NONE,
+                ));
+            } else {
+                let alpha = 0.16 + 0.22 * t.confidence.clamp(0.0, 1.0);
+                painter.line_segment(
+                    [pos2(x - 2.0, tip), pos2(x + 2.0, tip)],
+                    Stroke::new(1.1, fade(NEON, alpha)),
+                );
+            }
         } else if t.confidence > 0.15 {
             // Detected, not yet trusted enough to cut: a quiet mark, brighter
             // as confidence builds.
