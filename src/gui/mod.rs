@@ -497,15 +497,15 @@ mod tests {
         }
     }
 
-    /// One of everything that draws differently: a cut (slope row live, no gain
-    /// and no Q), a dynamic bell (meter, travel marker, per-frame curve), and a
-    /// disabled side-only shelf (badge, dimmed, hidden in most channel views).
-    /// The cut takes the steepest slope on offer — the near-vertical edge is
-    /// where curve rendering artifacts show first.
+    /// One of everything that draws differently: a cut (slope row live, no
+    /// gain, Q as corner lift), a dynamic bell (meter, travel marker, per-frame
+    /// curve), and a disabled side-only shelf (badge, dimmed, hidden in most
+    /// channel views). The cut takes the steepest slope and a Q above flat —
+    /// that edge and the peak on it are where rendering artifacts show first.
     pub(super) fn a_bit_of_everything() -> Vec<state::BandView> {
         let mut cut = band(0, BandKind::LowCut, 40.0);
         cut.gain = 0.0;
-        cut.slope = crate::params::Slope::S96;
+        cut.slope = crate::params::Slope::S48;
 
         let mut dynamic = band(1, BandKind::Bell, 1000.0);
         dynamic.dynamic = true;
@@ -906,7 +906,14 @@ mod tests {
 
         let (harness, mut view) = fixture_sized(width, height);
         let bands = a_bit_of_everything();
-        view.selected = Some(1);
+        // `EQUZX_PREVIEW_BAND=<slot>` picks which band the strip shows; the
+        // three in the fixture draw quite different rows of controls.
+        view.selected = Some(
+            std::env::var("EQUZX_PREVIEW_BAND")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
+        );
 
         // `EQUZX_PREVIEW_MENU=<id>` renders with that popover open — the only
         // way to look at a menu's layout without a pointer.

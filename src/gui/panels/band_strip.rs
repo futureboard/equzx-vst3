@@ -337,41 +337,45 @@ fn filter_row(
             }
             });
 
-            let is_cut = band.kind.is_cut();
+            let has_slope = band.kind.uses_slope();
+            let floor = edit::slope_floor(band.kind);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 chrome::caption(ui, "Slope");
                 ui.label(
                     nih_plug_egui::egui::RichText::new("dB / oct")
                         .font(theme::caption())
-                        .color(white(if is_cut { 64 } else { 32 })),
+                        .color(white(if has_slope { 64 } else { 32 })),
                 );
             });
+            const SLOPE_LABELS: [&str; SLOPES.len()] = ["6", "12", "24", "36", "48"];
             let current = SLOPES
                 .iter()
                 .position(|slope| *slope == band.slope)
-                .unwrap_or(1);
+                .unwrap_or(2)
+                .max(floor)
+                - floor;
             let control = ui.scope(|ui| {
-                if !is_cut {
+                if !has_slope {
                     ui.disable();
                     ui.set_opacity(0.38);
                 }
                 if let Some(index) = chrome::segmented(
                     ui,
-                    &["12", "24", "36", "48", "72", "96"],
+                    &SLOPE_LABELS[floor..],
                     current,
                     color,
                     29.0,
                     25.0,
                     FontId::proportional(theme::TINY),
                 ) {
-                    edit::set_slope(frame, band.slot, SLOPES[index]);
+                    edit::set_slope(frame, band.slot, SLOPES[floor + index]);
                 }
             });
-            if !is_cut {
-                control.response.on_hover_text(
-                    "Slope is available for low-cut and high-cut filters",
-                );
+            if !has_slope {
+                control
+                    .response
+                    .on_hover_text("Slope is available for cut and shelf filters");
             }
         });
 
@@ -403,11 +407,17 @@ fn filter_row(
         {
             edit::set_gain(frame, band.slot, v);
         }
+        // A cut's Q is resonant lift, so it rests at the Butterworth value.
+        let q_default = if band.kind.is_cut() {
+            crate::dsp::biquad::FLAT_Q
+        } else {
+            1.0
+        };
         if let Some(v) = Knob::new("Q", band.q, 0.025, 40.0, &q_fmt)
             .log(true)
-            .default_value(1.0)
+            .default_value(q_default)
             .color(color)
-            .disabled(!uses_q(band.kind))
+            .disabled(!band.kind.uses_q(band.slope))
             .show(ui)
         {
             edit::set_q(frame, band.slot, v);
@@ -748,12 +758,6 @@ fn res_menu(ui: &mut Ui, frame: &Frame, band: &BandView, color: Color32) {
             ui.add_space(4.0);
         },
     );
-}
-
-/// Shelves are fixed at S = 1 in the engine, so exposing a Q for them would be a
-/// control that changes nothing.
-fn uses_q(kind: BandKind) -> bool {
-    matches!(kind, BandKind::Bell | BandKind::Notch | BandKind::BandPass)
 }
 
 #[cfg(test)]

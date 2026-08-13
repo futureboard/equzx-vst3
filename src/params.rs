@@ -44,9 +44,29 @@ pub enum BandKind {
 }
 
 impl BandKind {
-    /// Cut types are Butterworth cascades; everything else is a single section.
+    /// Runs all the way down, rather than settling on a level or a bump.
     pub fn is_cut(self) -> bool {
         matches!(self, BandKind::LowCut | BandKind::HighCut)
+    }
+
+    /// Cuts and shelves are cascades with a steepness to pick; the rest are
+    /// one section.
+    pub fn uses_slope(self) -> bool {
+        matches!(
+            self,
+            BandKind::LowCut | BandKind::HighCut | BandKind::LowShelf | BandKind::HighShelf
+        )
+    }
+
+    /// Shelves are fixed by their order, and so is a 6 dB/oct cut. Everything
+    /// else reads Q — for a cut as resonant lift at the corner, flat at
+    /// [`crate::dsp::biquad::FLAT_Q`].
+    pub fn uses_q(self, slope: Slope) -> bool {
+        match self {
+            BandKind::LowShelf | BandKind::HighShelf => false,
+            BandKind::LowCut | BandKind::HighCut => slope != Slope::S6,
+            _ => true,
+        }
     }
 
     /// Only these types have a gain to move, so only these can be dynamic.
@@ -158,9 +178,12 @@ pub enum Domain {
     MidSide,
 }
 
-/// Cut slopes, in dB/oct. Only even filter orders exist, hence multiples of 12.
+/// Cut and shelf slopes, in dB/oct, one pole per 6 dB.
 #[derive(Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Slope {
+    #[id = "6"]
+    #[name = "6 dB/oct"]
+    S6,
     #[id = "12"]
     #[name = "12 dB/oct"]
     S12,
@@ -173,41 +196,42 @@ pub enum Slope {
     #[id = "48"]
     #[name = "48 dB/oct"]
     S48,
-    #[id = "72"]
-    #[name = "72 dB/oct"]
-    S72,
-    #[id = "96"]
-    #[name = "96 dB/oct"]
-    S96,
 }
 
 impl Slope {
     pub fn db_per_oct(self) -> u32 {
         match self {
+            Slope::S6 => 6,
             Slope::S12 => 12,
             Slope::S24 => 24,
             Slope::S36 => 36,
             Slope::S48 => 48,
-            Slope::S72 => 72,
-            Slope::S96 => 96,
         }
     }
 
-    /// Filter order — the cascade holds half this many second-order sections.
+    /// Filter order, which is the pole count the design is asked for.
     pub fn order(self) -> usize {
         (self.db_per_oct() / 6) as usize
     }
 
     pub fn from_db_per_oct(v: u32) -> Option<Self> {
         Some(match v {
+            6 => Slope::S6,
             12 => Slope::S12,
             24 => Slope::S24,
             36 => Slope::S36,
             48 => Slope::S48,
-            72 => Slope::S72,
-            96 => Slope::S96,
             _ => return None,
         })
+    }
+
+    /// The closest slope this build offers to `v` dB/oct, so that presets
+    /// naming the old 72 and 96 come back steep rather than on the default.
+    pub fn nearest_db_per_oct(v: u32) -> Self {
+        const ALL: [Slope; 5] = [Slope::S6, Slope::S12, Slope::S24, Slope::S36, Slope::S48];
+        *ALL.iter()
+            .min_by_key(|slope| slope.db_per_oct().abs_diff(v))
+            .unwrap_or(&Slope::S24)
     }
 }
 
@@ -445,7 +469,7 @@ impl Default for BandParams {
 
             q: FloatParam::new(
                 "Q",
-                1.0,
+                crate::dsp::biquad::FLAT_Q,
                 FloatRange::Skewed {
                     min: 0.025,
                     max: 40.0,

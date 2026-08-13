@@ -327,14 +327,38 @@ impl UiState {
 
 // --- snapshots ---------------------------------------------------------------
 
+/// Schema version this build writes into every snapshot it saves.
+pub const SCHEMA: u32 = 1;
+
+/// The schema at which a cut band's Q started shaping the filter.
+///
+/// Before it cuts were fixed Butterworth and their Q sat unread, so honouring
+/// the stored value now would put a resonant lift on every cut anyone ever
+/// saved. Older snapshots have their cuts put back on flat.
+pub const SCHEMA_CUT_Q: u32 = 1;
+
 /// Everything an A/B slot or a preset carries.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Snapshot {
     pub bands: Vec<BandSnapshot>,
     pub output_gain: f32,
     pub phase_invert: bool,
     pub resonance: ResonanceSnapshot,
+    #[serde(default)]
+    pub schema: u32,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            bands: Vec::new(),
+            output_gain: 0.0,
+            phase_invert: false,
+            resonance: ResonanceSnapshot::default(),
+            schema: SCHEMA,
+        }
+    }
 }
 
 impl Snapshot {
@@ -349,6 +373,7 @@ impl Snapshot {
             output_gain: params.output_gain.value(),
             phase_invert: params.phase_invert.value(),
             resonance: ResonanceSnapshot::capture(&params.resonance),
+            schema: SCHEMA,
         }
     }
 
@@ -356,16 +381,24 @@ impl Snapshot {
     /// session written by a different version. Every field is clamped to the
     /// range its parameter will accept.
     pub fn sanitized(&self) -> Self {
+        let legacy_cut_q = self.schema < SCHEMA_CUT_Q;
         Self {
             bands: self
                 .bands
                 .iter()
                 .take(MAX_BANDS)
-                .map(BandSnapshot::sanitized)
+                .map(|band| {
+                    let mut band = band.sanitized();
+                    if legacy_cut_q && band.kind.is_cut() {
+                        band.q = crate::dsp::biquad::FLAT_Q;
+                    }
+                    band
+                })
                 .collect(),
             output_gain: finite(self.output_gain, 0.0).clamp(-24.0, 12.0),
             phase_invert: self.phase_invert,
             resonance: self.resonance.sanitized(),
+            schema: SCHEMA,
         }
     }
 
@@ -409,7 +442,7 @@ impl Default for BandSnapshot {
             channel: BandChannel::Stereo,
             freq: 1000.0,
             gain: 0.0,
-            q: 1.0,
+            q: crate::dsp::biquad::FLAT_Q,
             slope: Slope::S24,
             enabled: true,
             dynamic: false,
@@ -461,7 +494,7 @@ impl BandSnapshot {
         Self {
             freq: finite(self.freq, 1000.0).clamp(20.0, 22_000.0),
             gain: finite(self.gain, 0.0).clamp(-30.0, 30.0),
-            q: finite(self.q, 1.0).clamp(0.025, 40.0),
+            q: finite(self.q, crate::dsp::biquad::FLAT_Q).clamp(0.025, 40.0),
             dyn_range: finite(self.dyn_range, -6.0).clamp(-30.0, 30.0),
             threshold: finite(self.threshold, -24.0).clamp(-70.0, 0.0),
             attack: finite(self.attack, 20.0).clamp(1.0, 300.0),
@@ -631,7 +664,7 @@ impl From<BandWire> for BandSnapshot {
             freq: w.freq,
             gain: w.gain,
             q: w.q,
-            slope: Slope::from_db_per_oct(w.slope).unwrap_or(Slope::S24),
+            slope: Slope::nearest_db_per_oct(w.slope),
             enabled: w.enabled,
             dynamic: w.dynamic,
             dyn_mode: DynMode::from_wire(&w.dyn_mode).unwrap_or(DynMode::Above),
@@ -753,7 +786,7 @@ mod tests {
                 channel: BandChannel::Mid,
                 freq: 250.0,
                 q: 8.0,
-                slope: Slope::S96,
+                slope: Slope::S48,
                 dyn_mode: DynMode::Below,
                 ..BandSnapshot::default()
             }],
@@ -763,7 +796,7 @@ mod tests {
         let text = serde_json::to_string(&snap).unwrap();
         assert!(text.contains(r#""type":"notch""#));
         assert!(text.contains(r#""channel":"mid""#));
-        assert!(text.contains(r#""slope":96"#));
+        assert!(text.contains(r#""slope":48"#));
 
         let back: Snapshot = serde_json::from_str(&text).unwrap();
         assert_eq!(back, snap);
@@ -778,7 +811,7 @@ mod tests {
         let band = snap.bands[0];
         assert_eq!(band.kind, BandKind::Bell);
         assert_eq!(band.channel, BandChannel::Stereo);
-        assert_eq!(band.slope, Slope::S24);
+        assert_eq!(band.slope, Slope::S12);
         assert_eq!(band.freq, 22_000.0);
         assert_eq!(band.q, 0.025);
         assert_eq!(band.gain, 30.0);
@@ -797,7 +830,7 @@ mod tests {
         assert_eq!(band.freq, 1000.0);
         // Infinity falls back rather than clamping to the top of the range:
         // a preset that lost a value should read as "unset", not "maximum".
-        assert_eq!(band.q, 1.0);
+        assert_eq!(band.q, crate::dsp::biquad::FLAT_Q);
     }
 
     #[test]

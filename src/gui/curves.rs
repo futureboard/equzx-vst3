@@ -13,9 +13,8 @@
 //! into a dozen multiply-adds, which is the difference between a frame budget
 //! spent and a frame budget noticed.
 
-use crate::dsp::biquad::{butterworth_qs, Coeffs, MAX_SECTIONS};
+use crate::dsp::biquad::{band_cascade, Coeffs, MAX_SECTIONS};
 use crate::gui::state::BandView;
-use crate::params::BandKind;
 
 /// Display limits. The analyser clamps its own top end to Nyquist; the axis does
 /// not move, so a 44.1 kHz session simply has nothing drawn in its last few
@@ -32,10 +31,11 @@ pub const CURVE_POINTS: usize = 960;
 /// The frequencies a curve is evaluated at, with the per-frequency terms of
 /// `|H(e^jw)|` already worked out.
 ///
-/// The trig tables and the evaluation are f64 on purpose. At the low end of
+/// The trig tables and the evaluation are f64 on purpose, and so are the
+/// coefficients they are evaluated against — see [`Coeffs`]. At the low end of
 /// the axis `cos ω` sits within 1e-5 of 1.0, and the magnitude formula
 /// cancels terms of size 2 down to that residue — in f32 that leaves a few
-/// percent of noise per section, and a steep cut cascades eight sections, so
+/// percent of noise per section, and a steep cut cascades four sections, so
 /// the drawn curve wobbled by whole pixels. In f64 the cancellation keeps
 /// twelve clean digits and the curve is exact to far below a pixel.
 pub struct ResponseGrid {
@@ -127,13 +127,11 @@ impl ResponseGrid {
     pub fn magnitude(&self, c: &Coeffs, i: usize) -> f64 {
         let (cw, sw) = (self.cos_w[i], self.sin_w[i]);
         let (c2w, s2w) = (self.cos_2w[i], self.sin_2w[i]);
-        let (b0, b1, b2) = (c.b0 as f64, c.b1 as f64, c.b2 as f64);
-        let (a1, a2) = (c.a1 as f64, c.a2 as f64);
 
-        let num_re = b0 + b1 * cw + b2 * c2w;
-        let num_im = -(b1 * sw + b2 * s2w);
-        let den_re = 1.0 + a1 * cw + a2 * c2w;
-        let den_im = -(a1 * sw + a2 * s2w);
+        let num_re = c.b0 + c.b1 * cw + c.b2 * c2w;
+        let num_im = -(c.b1 * sw + c.b2 * s2w);
+        let den_re = 1.0 + c.a1 * cw + c.a2 * c2w;
+        let den_im = -(c.a1 * sw + c.a2 * s2w);
 
         let den = den_re.hypot(den_im);
         if den == 0.0 {
@@ -160,32 +158,25 @@ impl ResponseGrid {
     }
 }
 
-/// Expand one band into the sections that realise it. Cut bands become a
-/// Butterworth cascade; everything else is a single section.
+/// Expand one band into the sections that realise it.
 ///
-/// The mirror of `bandSections` in `dsp/bands.ts`, and of what
-/// [`crate::dsp::engine`] builds for the audio path — which is the point: a
-/// curve the display draws and a curve the user hears have to be the same one.
+/// Not a second implementation: it calls the same [`band_cascade`] the audio
+/// path does, which is the only way the drawn curve and the heard curve stay
+/// the same curve.
 pub fn band_sections(band: &BandView, sample_rate: f32, out: &mut Vec<Coeffs>) {
     out.clear();
     let f = band.freq.clamp(10.0, sample_rate / 2.0 - 1.0);
-    match band.kind {
-        BandKind::Bell => out.push(Coeffs::peaking(f, band.q, band.gain, sample_rate)),
-        BandKind::LowShelf => out.push(Coeffs::low_shelf(f, band.gain, sample_rate)),
-        BandKind::HighShelf => out.push(Coeffs::high_shelf(f, band.gain, sample_rate)),
-        BandKind::Notch => out.push(Coeffs::notch(f, band.q, sample_rate)),
-        BandKind::BandPass => out.push(Coeffs::bandpass(f, band.q, sample_rate)),
-        BandKind::LowCut | BandKind::HighCut => {
-            let mut qs = [0.0f32; MAX_SECTIONS];
-            let n = butterworth_qs(band.slope.order(), &mut qs);
-            for &q in qs.iter().take(n) {
-                out.push(match band.kind {
-                    BandKind::LowCut => Coeffs::highpass(f, q, sample_rate),
-                    _ => Coeffs::lowpass(f, q, sample_rate),
-                });
-            }
-        }
-    }
+    let mut sections = [Coeffs::identity(); MAX_SECTIONS];
+    let n = band_cascade(
+        band.kind,
+        f,
+        sample_rate,
+        band.slope.order(),
+        band.q,
+        band.gain,
+        &mut sections,
+    );
+    out.extend_from_slice(&sections[..n]);
 }
 
 /// Q to bandwidth in octaves, and back — the RBJ relation the Q handles are
@@ -201,7 +192,8 @@ pub fn octaves_to_q(bandwidth: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{BandChannel, DynMode, Slope};
+    use crate::dsp::biquad::FLAT_Q;
+    use crate::params::{BandChannel, BandKind, DynMode, Slope};
 
     const SR: f32 = 48_000.0;
 
@@ -268,12 +260,12 @@ mod tests {
     fn a_cut_is_three_db_down_at_its_corner_whatever_the_slope() {
         let grid = ResponseGrid::new(SR);
         let mut sections = Vec::new();
-        for slope in [Slope::S12, Slope::S24, Slope::S48, Slope::S96] {
-            let mut band = bell(100.0, 0.0, 1.0);
+        for slope in [Slope::S6, Slope::S12, Slope::S24, Slope::S36, Slope::S48] {
+            let mut band = bell(100.0, 0.0, FLAT_Q);
             band.kind = BandKind::LowCut;
             band.slope = slope;
             band_sections(&band, SR, &mut sections);
-            assert_eq!(sections.len(), slope.order() / 2);
+            assert_eq!(sections.len(), slope.order().div_ceil(2));
 
             let at_corner = grid.db_at(&sections, point_for(100.0));
             assert!(
@@ -281,14 +273,52 @@ mod tests {
                 "{:?} read {at_corner} dB at the corner",
                 slope
             );
-            // And an octave below, roughly the slope it advertises.
-            let below = grid.db_at(&sections, point_for(50.0));
-            let expected = -(slope.db_per_oct() as f32);
+            // And two octaves below, roughly the slope it advertises.
+            // One octave is still inside the knee for the shallow orders.
+            let below = grid.db_at(&sections, point_for(25.0));
+            let expected = -2.0 * slope.db_per_oct() as f32;
             assert!(
-                (below - expected).abs() < expected.abs() * 0.2,
-                "{:?} read {below} dB an octave down, expected near {expected}",
+                (below - expected).abs() < expected.abs() * 0.15,
+                "{:?} read {below} dB two octaves down, expected near {expected}",
                 slope
             );
+        }
+    }
+
+    #[test]
+    fn a_cut_with_a_high_q_lifts_its_own_corner() {
+        let grid = ResponseGrid::new(SR);
+        let mut sections = Vec::new();
+        let mut band = bell(1000.0, 0.0, 4.0);
+        band.kind = BandKind::HighCut;
+        band.slope = Slope::S24;
+        band_sections(&band, SR, &mut sections);
+        let at_corner = grid.db_at(&sections, point_for(1000.0));
+        assert!(
+            (at_corner - 20.0 * 4.0f32.log10()).abs() < 0.2,
+            "read {at_corner} dB at the corner, wanted {}",
+            20.0 * 4.0f32.log10()
+        );
+    }
+
+    #[test]
+    fn a_shelf_takes_its_slope_from_the_same_control() {
+        let grid = ResponseGrid::new(SR);
+        let mut sections = Vec::new();
+        let mut previous = 0usize;
+        for slope in [Slope::S12, Slope::S24, Slope::S36, Slope::S48] {
+            let mut band = bell(1000.0, 12.0, FLAT_Q);
+            band.kind = BandKind::LowShelf;
+            band.slope = slope;
+            band_sections(&band, SR, &mut sections);
+            assert_eq!(sections.len(), slope.order() / 2);
+            assert!(sections.len() > previous);
+            previous = sections.len();
+
+            let corner = grid.db_at(&sections, point_for(1000.0));
+            assert!((corner - 6.0).abs() < 0.1, "{slope:?} read {corner} dB");
+            let plateau = grid.db_at(&sections, point_for(30.0));
+            assert!((plateau - 12.0).abs() < 0.2, "{slope:?} settled at {plateau} dB");
         }
     }
 
