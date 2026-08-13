@@ -2,6 +2,7 @@
 
 pub mod chrome;
 pub mod glyph;
+pub mod io_meter;
 pub mod knob;
 pub mod menu;
 

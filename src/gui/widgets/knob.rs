@@ -18,8 +18,21 @@ const ARC: f32 = 270.0;
 const START: f32 = -135.0;
 
 /// How much of the range a pixel of drag is worth, coarse and fine.
-const SPEED: f32 = 0.004;
-const SPEED_FINE: f32 = 0.0008;
+/// A full coarse sweep is roughly 140 px; Shift keeps precise trimming.
+const SPEED: f32 = 0.007;
+const SPEED_FINE: f32 = 0.0012;
+const SCROLL_SPEED: f32 = 0.045;
+const SCROLL_SPEED_FINE: f32 = 0.009;
+
+/// Turn egui's device-dependent wheel points into useful notches. Preserve
+/// magnitude so a fast wheel spin is not collapsed into a single tiny step.
+fn scroll_steps(delta: f32) -> f32 {
+    if delta.abs() <= 0.1 {
+        0.0
+    } else {
+        delta.signum() * (delta.abs() / 14.0).clamp(0.35, 5.0)
+    }
+}
 
 pub struct Knob<'a> {
     pub label: &'a str,
@@ -158,15 +171,37 @@ impl<'a> Knob<'a> {
 
         let mut changed = None;
         if !self.disabled {
-            // Deltas are accumulated rather than measured from the press: the
-            // caller writes the result back to the parameter and this reads it
-            // again next frame, so there is nothing for the drift to build up in.
-            let dy = response.drag_delta().y;
-            if dy != 0.0 {
+            // `Response::drag_delta()` is cumulative for the whole gesture.
+            // Adding that to the current parameter every frame caused the dial
+            // to accelerate, jump, and fight host parameter feedback. Pointer
+            // delta is frame-local and starts responding on the first movement,
+            // without waiting for egui's drag threshold.
+            let primary_held = ui.input(|i| i.pointer.primary_down());
+            let dy = ui.input(|i| i.pointer.delta().y);
+            if primary_held && response.is_pointer_button_down_on() && dy != 0.0 {
                 let fine = ui.input(|i| i.modifiers.shift_only());
                 let speed = if fine { SPEED_FINE } else { SPEED };
                 let next = (self.to_norm(self.value) - dy * speed).clamp(0.0, 1.0);
                 changed = Some(self.denorm(next));
+            }
+            if response.hovered() {
+                let (wheel, fine) = ui.input(|i| {
+                    // egui maps Shift+wheel onto X, so accept either axis.
+                    let raw = i.raw_scroll_delta;
+                    let wheel = if raw.y.abs() >= raw.x.abs() { raw.y } else { raw.x };
+                    (wheel, i.modifiers.shift_only())
+                });
+                let steps = scroll_steps(wheel);
+                if steps != 0.0 {
+                    let current = changed.unwrap_or(self.value);
+                    let speed = if fine {
+                        SCROLL_SPEED_FINE
+                    } else {
+                        SCROLL_SPEED
+                    };
+                    let next = (self.to_norm(current) + steps * speed).clamp(0.0, 1.0);
+                    changed = Some(self.denorm(next));
+                }
             }
             if response.double_clicked() {
                 changed = self.default;
@@ -183,6 +218,19 @@ impl<'a> Knob<'a> {
         paint_caption(ui, rect, dial_rect, &self, &text, alpha);
 
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wheel_steps_keep_direction_and_fast_spin_magnitude() {
+        assert_eq!(scroll_steps(0.0), 0.0);
+        assert!(scroll_steps(14.0) > 0.9);
+        assert!(scroll_steps(-14.0) < -0.9);
+        assert!(scroll_steps(56.0) > scroll_steps(14.0));
     }
 }
 

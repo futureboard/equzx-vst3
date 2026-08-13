@@ -161,10 +161,27 @@ jobs:
           merge-multiple: true
 
       - name: List what is being published
-        run: ls -lh installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          expected=(
+            "EQUZX-${version}-windows.exe"
+            "EQUZX-${version}-macos-universal.pkg"
+            "EQUZX-${version}-macos-arm64.pkg"
+            "EQUZX-${version}-macos-x86_64.pkg"
+          )
+          for asset in "${expected[@]}"; do
+            test -s "installers/$asset" || {
+              echo "missing or empty release asset: $asset"
+              exit 1
+            }
+          done
+          ls -lh installers
 
       - uses: softprops/action-gh-release@v2
         with:
+          name: EQUZX ${{ steps.version.outputs.version }}
           files: installers/*
           generate_release_notes: true
           draft: true

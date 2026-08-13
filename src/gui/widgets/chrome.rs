@@ -60,19 +60,25 @@ pub fn fill_glass(
     // Opaque, and close to what the blur averages out to, so a frame that falls
     // back to it looks deliberate rather than broken. Keep this visibly above
     // the root surface: hosts often provide a darker framebuffer than preview.
-    painter.set(
-        slot.fill,
+    let fallback = if fx.is_ready() {
+        // Once the programs are live the shader itself supplies the tinted
+        // body. Leaving an opaque shape here would make the backdrop capture
+        // sample this flat fill instead of the plot behind the panel.
+        nih_plug_egui::egui::Shape::Noop
+    } else {
         nih_plug_egui::egui::epaint::RectShape::filled(
             rect,
             corner,
             Color32::from_rgb(0x22, 0x22, 0x29),
-        ),
-    );
+        )
+        .into()
+    };
+    painter.set(slot.fill, fallback);
     if let Some(p) = sheen {
         style.sheen = Some(Pos2::new(p.x - rect.min.x, p.y - rect.min.y));
         style.sheen_amount = 0.07;
     }
-    painter.set(slot.blur, fx.glass(rect, style));
+    painter.set(slot.blur, fx.glass(ui.ctx(), rect, style));
     painter.set(
         slot.border,
         nih_plug_egui::egui::epaint::RectShape::stroke(

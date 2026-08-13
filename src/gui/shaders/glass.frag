@@ -55,11 +55,11 @@ void main() {
     vec2 half_size = u_size * 0.5;
     float d = rounded_box(centred, half_size, u_radius);
 
-    // One pixel of feather, so the corners are as smooth as egui's own.
-    float mask = 1.0 - smoothstep(-1.0, 0.5, d);
-    if (mask <= 0.002) {
-        discard;
-    }
+    // Derivative coverage follows the physical pixel footprint at straight
+    // edges and corners alike. The old fixed, asymmetric interval shrank the
+    // plate and shimmered when its point-space rectangle landed between pixels.
+    float aa = clamp(fwidth(d), 0.75, 1.5);
+    float mask = 1.0 - smoothstep(-0.5 * aa, 0.5 * aa, d);
 
     // --- body ------------------------------------------------------------
     vec3 col = mix(texture(u_tex, v_uv * u_uv_scale + u_uv_offset).rgb, u_tint.rgb, u_tint.a);

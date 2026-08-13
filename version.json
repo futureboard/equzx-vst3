@@ -1,8 +1,8 @@
 {
   "name": "EQUZX",
   "vendor": "Futureboard Digital Technologies",
-  "version": "2026.8.12",
-  "released": "2026-08-12",
+  "version": "2026.8.13",
+  "released": "2026-08-13",
   "bundleId": "digital.futureboard.equzx",
   "url": "https://futureboard.digital",
   "formats": ["VST3", "CLAP"],

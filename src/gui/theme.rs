@@ -175,6 +175,18 @@ pub fn corner(radius: u8) -> CornerRadius {
 pub fn apply(ctx: &nih_plug_egui::egui::Context) {
     ctx.set_fonts(fonts());
 
+    // The OpenGL surface is not multisampled; egui's physical-pixel feather is
+    // therefore the AA path for all native geometry. Keep it explicit so host
+    // or persisted context options cannot leave curves and rounded controls
+    // with hard raster edges.
+    ctx.tessellation_options_mut(|options| {
+        options.feathering = true;
+        options.feathering_size_in_pixels = 1.0;
+        options.round_line_segments_to_pixels = true;
+        options.round_rects_to_pixels = true;
+        options.round_text_to_pixels = true;
+    });
+
     let text_styles = [
         (TextStyle::Small, font(MICRO)),
         (TextStyle::Body, font(SMALL)),

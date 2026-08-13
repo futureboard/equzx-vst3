@@ -48,7 +48,7 @@ sudo apt install libasound2-dev libjack-jackd2-dev libx11-xcb-dev libgl1-mesa-de
 
 ```sh
 # Windows — needs Inno Setup 6
-iscc /DVersion=2026.8.12 installer\windows\equzx.iss
+iscc /DVersion=2026.8.13 installer\windows\equzx.iss
 
 # macOS
 installer/macos/build-pkg.sh

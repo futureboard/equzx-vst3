@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use nih_plug_egui::egui::{
     epaint::{PathShape, PathStroke},
     pos2, vec2, Align2, Color32, FontId, Mesh, PointerButton, Pos2, Rect, Sense, Shape, Stroke, Ui,
+    Vec2,
 };
 
 use crate::analyzer::{CEIL_DB, FLOOR_DB};
@@ -32,6 +33,27 @@ pub const PAD_TOP: f32 = 14.0;
 pub const PAD_RIGHT: f32 = 14.0;
 pub const PAD_BOTTOM: f32 = 26.0;
 pub const PAD_LEFT: f32 = 40.0;
+
+/// Normal sweeps move slightly faster than the pointer; Shift remains precise.
+const HANDLE_DRAG_SPEED: f32 = 1.45;
+const HANDLE_DRAG_FINE_SPEED: f32 = 0.28;
+const WHEEL_POINTS_PER_NOTCH: f32 = 14.0;
+
+fn wheel_steps(delta: f32) -> f32 {
+    if delta.abs() <= 0.1 {
+        0.0
+    } else {
+        delta.signum() * (delta.abs() / WHEEL_POINTS_PER_NOTCH).clamp(0.35, 5.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BandDrag {
+    slot: usize,
+    pointer_start: Pos2,
+    freq_start: f32,
+    gain_start: f32,
+}
 
 const FREQ_TICKS: [f32; 22] = [
     20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 800.0, 1000.0,
@@ -80,6 +102,9 @@ pub struct Display {
     draft: Option<usize>,
     /// The band being auditioned with a right-drag, and what was soloed before.
     audition: Option<(usize, Option<usize>)>,
+    /// Stable gesture origin for a primary handle drag. Using this instead of
+    /// repeatedly adding egui's cumulative drag delta prevents jumps.
+    primary_drag: Option<BandDrag>,
     hovered: Option<usize>,
 }
 
@@ -107,6 +132,7 @@ impl Display {
             post: spectrum::Scratch::new(),
             draft: None,
             audition: None,
+            primary_drag: None,
             hovered: None,
         }
     }
@@ -255,6 +281,7 @@ impl Display {
         if !bypassed {
             let tune = crate::gui::tune::get();
             ui.painter().add(frame.fx.bloom(
+                ui.ctx(),
                 plot,
                 Bloom {
                     tint: Color32::from_rgb(0xff, 0xa8, 0xd0),
@@ -334,6 +361,7 @@ impl Display {
             NEON,
             0.22,
             0.02,
+            1.0 / painter.ctx().pixels_per_point(),
         ));
         // Three strokes deep: a wide whisper, a pink inner glow, and the
         // crisp pale core — analytic light rather than screen-wide bloom.
@@ -430,6 +458,7 @@ impl Display {
         // --- handles -------------------------------------------------------
         let fine = ui.input(|i| i.modifiers.shift_only());
         let alt = ui.input(|i| i.modifiers.alt);
+        let primary_down = ui.input(|i| i.pointer.primary_down());
         let mut hovered = None;
 
         for band in bands {
@@ -464,7 +493,9 @@ impl Display {
                 }
             }
 
-            let hit = Rect::from_center_size(centre, vec2(28.0, 28.0));
+            // The painted node stays compact, but its hit target is generous
+            // enough to catch a quick press on high-DPI displays.
+            let hit = Rect::from_center_size(centre, vec2(38.0, 38.0));
             let response = ui.interact(
                 hit,
                 ui.id().with(("handle", band.slot)),
@@ -476,6 +507,20 @@ impl Display {
 
             if response.clicked() {
                 *selected = Some(band.slot);
+            }
+            if primary_down
+                && response.is_pointer_button_down_on()
+                && self.primary_drag.is_none()
+            {
+                if let Some(pointer_start) = response.interact_pointer_pos() {
+                    self.primary_drag = Some(BandDrag {
+                        slot: band.slot,
+                        pointer_start,
+                        freq_start: band.freq,
+                        gain_start: band.gain,
+                    });
+                    *selected = Some(band.slot);
+                }
             }
             if response.double_clicked() {
                 edit::remove_band(frame, band.slot);
@@ -495,19 +540,43 @@ impl Display {
             }
             if response.dragged_by(PointerButton::Secondary) {
                 let scale = if fine { 0.25 } else { 1.0 };
-                let x = axes.x(band.freq) + response.drag_delta().x * scale;
+                let dx = ui.input(|i| i.pointer.delta().x);
+                let x = axes.x(band.freq) + dx * scale * HANDLE_DRAG_SPEED;
                 edit::set_freq(frame, band.slot, axes.freq_at(x));
             }
 
-            if response.dragged_by(PointerButton::Primary) {
-                let scale = if fine { 0.25 } else { 1.0 };
-                let delta = response.drag_delta() * scale;
-                edit::set_freq(frame, band.slot, axes.freq_at(axes.x(band.freq) + delta.x));
+            if let Some(drag) = self
+                .primary_drag
+                .filter(|drag| drag.slot == band.slot && primary_down)
+            {
+                let scale = if fine {
+                    HANDLE_DRAG_FINE_SPEED
+                } else {
+                    HANDLE_DRAG_SPEED
+                };
+                let pointer = ui
+                    .ctx()
+                    .pointer_latest_pos()
+                    .unwrap_or(drag.pointer_start);
+                let delta: Vec2 = (pointer - drag.pointer_start) * scale;
+                edit::set_freq(
+                    frame,
+                    band.slot,
+                    axes.freq_at(axes.x(drag.freq_start) + delta.x),
+                );
                 // Alt pins the gain, so a band can be swept without its level moving.
                 if band.kind.uses_gain() && !alt {
-                    edit::set_gain(frame, band.slot, axes.db_at(axes.y(band.gain) + delta.y));
+                    edit::set_gain(
+                        frame,
+                        band.slot,
+                        axes.db_at(axes.y(drag.gain_start) + delta.y),
+                    );
                 }
             }
+        }
+
+        if !primary_down {
+            self.primary_drag = None;
         }
 
         if let Some((slot, previous)) = self.audition {
@@ -524,21 +593,25 @@ impl Display {
         let focus = hovered.or(*selected);
         if let Some(slot) = focus {
             if background.hovered() || hovered.is_some() {
-                let scroll = ui.input(|i| i.raw_scroll_delta.y);
-                if scroll.abs() > 0.1 {
+                let scroll = ui.input(|i| {
+                    let raw = i.raw_scroll_delta;
+                    if raw.y.abs() >= raw.x.abs() { raw.y } else { raw.x }
+                });
+                let steps = wheel_steps(scroll);
+                if steps != 0.0 {
                     if let Some(band) = bands.iter().find(|b| b.slot == slot) {
                         // Scrolling up should open the filter out, which is the
                         // opposite sign to the wheel's own.
-                        let up = scroll > 0.0;
+                        let up = steps > 0.0;
                         if band.kind.uses_slope() {
-                            edit::step_slope(frame, slot, if up { -1 } else { 1 });
+                            let direction = if up { -1 } else { 1 };
+                            let count = steps.abs().ceil() as usize;
+                            for _ in 0..count {
+                                edit::step_slope(frame, slot, direction);
+                            }
                         } else if band.kind.uses_q(band.slope) {
-                            let factor = if fine { 1.02 } else { 1.1 };
-                            let q = if up {
-                                band.q * factor
-                            } else {
-                                band.q / factor
-                            };
+                            let octave_step = if fine { 0.025 } else { 0.14 };
+                            let q = band.q * 2.0f32.powf(steps * octave_step);
                             edit::set_q(frame, slot, q.clamp(Q_MIN, Q_MAX));
                         }
                     }
@@ -800,7 +873,9 @@ impl Axes {
 fn draw_grid(painter: &nih_plug_egui::egui::Painter, axes: &Axes) {
     let font = FontId::proportional(theme::TINY);
     for f in FREQ_TICKS {
-        let x = axes.x(f).round() + 0.5;
+        // The tessellator snaps straight segments in physical pixels. Rounding
+        // here in logical points first double-snaps at fractional DPI scales.
+        let x = axes.x(f);
         if x < axes.plot.min.x - 0.5 || x > axes.plot.max.x + 0.5 {
             continue;
         }
@@ -823,7 +898,7 @@ fn draw_grid(painter: &nih_plug_egui::egui::Painter, axes: &Axes) {
     let step = if axes.db_range <= 12.0 { 3.0 } else { 6.0 };
     let mut db = -axes.db_range;
     while db <= axes.db_range + 0.001 {
-        let y = axes.y(db).round() + 0.5;
+        let y = axes.y(db);
         painter.line_segment(
             [pos2(axes.plot.min.x, y), pos2(axes.plot.max.x, y)],
             Stroke::new(1.0, white(if db.abs() < 0.001 { 41 } else { 13 })),
@@ -926,6 +1001,7 @@ fn draw_spectrum(
                 &trace,
                 axes.plot.max.y,
                 Color32::from_rgba_unmultiplied(168, 165, 180, 12),
+                1.0 / painter.ctx().pixels_per_point(),
             ));
             painter.add(Shape::Path(PathShape {
                 points: trace,
@@ -939,7 +1015,12 @@ fn draw_spectrum(
                 .iter()
                 .map(|db| ((db - FLOOR_DB) / span).clamp(0.0, 1.0))
                 .collect();
-            painter.add(spectrum_fill(&trace, &energy, axes.plot));
+            painter.add(spectrum_fill(
+                &trace,
+                &energy,
+                axes.plot,
+                1.0 / painter.ctx().pixels_per_point(),
+            ));
 
             // The edge, three strokes deep: a wide whisper of glow, a soft
             // pink line, and the crisp pale core that stays readable over
@@ -987,14 +1068,22 @@ fn draw_spectrum(
 /// plum to almost nothing — and rides the trace, so a peak carries its own
 /// light down with it. The global one leans the whole field slightly darker
 /// toward the graph floor. The grid stays visible through all of it.
-fn spectrum_fill(trace: &[Pos2], energy: &[f32], plot: Rect) -> Shape {
+fn spectrum_fill(trace: &[Pos2], energy: &[f32], plot: Rect, feather: f32) -> Shape {
     let tune = crate::gui::tune::get();
     let fill = tune.spectrum_fill;
     let depth = tune.spectrum_depth;
 
-    // Distance below the curve each row sits, and the alpha it carries.
-    let offsets = [0.0, 10.0 * depth, 26.0 * depth, 64.0 * depth];
-    let alphas = [0.72 * fill, 0.46 * fill, 0.24 * fill, 0.10 * fill, 0.035 * fill];
+    // Distance below the curve each material row sits, and its alpha. A
+    // transparent row at the trace itself is added below so this raw Mesh gets
+    // the same one-physical-pixel edge coverage as tessellated paths.
+    let offsets = [10.0 * depth, 26.0 * depth, 64.0 * depth];
+    let alphas = [
+        0.72 * fill,
+        0.46 * fill,
+        0.24 * fill,
+        0.10 * fill,
+        0.035 * fill,
+    ];
 
     let mut mesh = Mesh::default();
     if trace.len() < 2 || plot.height() <= 0.0 {
@@ -1017,25 +1106,31 @@ fn spectrum_fill(trace: &[Pos2], energy: &[f32], plot: Rect) -> Shape {
             SPECTRUM_LOW,
             SPECTRUM_FLOOR,
         ];
-        for row in 0..5 {
-            let y = if row < 4 {
-                (p.y + offsets[row]).min(plot.max.y)
-            } else {
-                plot.max.y
-            };
-            mesh.colored_vertex(
-                pos2(p.x, y),
-                fade(colors[row], alphas[row] * depth_dim(y)),
-            );
+        mesh.colored_vertex(*p, Color32::TRANSPARENT);
+        // Keep rows ordered even at very small tuning depths. A folded strip
+        // can self-overlap and turn the feather back into a hard edge.
+        let first = (p.y + feather).min(plot.max.y);
+        let second = (p.y + offsets[0]).max(first).min(plot.max.y);
+        let third = (p.y + offsets[1]).max(second).min(plot.max.y);
+        let fourth = (p.y + offsets[2]).max(third).min(plot.max.y);
+        let rows = [
+            (first, colors[0], alphas[0]),
+            (second, colors[1], alphas[1]),
+            (third, colors[2], alphas[2]),
+            (fourth, colors[3], alphas[3]),
+            (plot.max.y, colors[4], alphas[4]),
+        ];
+        for (y, color, alpha) in rows {
+            mesh.colored_vertex(pos2(p.x, y), fade(color, alpha * depth_dim(y)));
         }
     }
 
-    // Two triangles per band per column pair, five rows to a column.
+    // Two triangles per band per column pair, six rows to a column.
     let cols = trace.len() as u32;
     for i in 0..cols - 1 {
-        for row in 0..4u32 {
-            let a = i * 5 + row;
-            let b = (i + 1) * 5 + row;
+        for row in 0..5u32 {
+            let a = i * 6 + row;
+            let b = (i + 1) * 6 + row;
             mesh.add_triangle(a, a + 1, b);
             mesh.add_triangle(a + 1, b, b + 1);
         }
@@ -1063,7 +1158,12 @@ fn draw_resonance(painter: &nih_plug_egui::egui::Painter, axes: &Axes, reduction
         return;
     }
 
-    painter.add(area_mesh(&points, zero, fade(NEON, 0.22)));
+    painter.add(area_mesh(
+        &points,
+        zero,
+        fade(NEON, 0.22),
+        1.0 / painter.ctx().pixels_per_point(),
+    ));
     painter.add(Shape::Path(PathShape {
         points,
         closed: false,
@@ -1207,7 +1307,12 @@ fn stroke_band(
         return;
     }
     if focused {
-        painter.add(area_mesh(&points, axes.y(0.0), fade(color, 0.12)));
+        painter.add(area_mesh(
+            &points,
+            axes.y(0.0),
+            fade(color, 0.12),
+            1.0 / painter.ctx().pixels_per_point(),
+        ));
         // The chosen band carries a little more light than its neighbours.
         painter.add(Shape::Path(PathShape {
             points: points.clone(),
@@ -1235,18 +1340,28 @@ fn stroke_band(
 /// path by fanning from its first vertex, which is right for a convex shape and
 /// wrong for the graph of a function — a spectrum would come out shot through
 /// with wedges.
-fn area_mesh(points: &[Pos2], baseline: f32, color: Color32) -> Shape {
+fn area_mesh(points: &[Pos2], baseline: f32, color: Color32, feather: f32) -> Shape {
     let mut mesh = Mesh::default();
     if color.a() == 0 || points.len() < 2 {
         return Shape::Mesh(mesh.into());
     }
     for p in points {
         let base = mesh.vertices.len() as u32;
-        mesh.colored_vertex(*p, color);
+        let toward_baseline = (baseline - p.y).signum();
+        let inner_y = if toward_baseline >= 0.0 {
+            (p.y + feather).min(baseline)
+        } else {
+            (p.y - feather).max(baseline)
+        };
+        mesh.colored_vertex(*p, Color32::TRANSPARENT);
+        mesh.colored_vertex(pos2(p.x, inner_y), color);
         mesh.colored_vertex(pos2(p.x, baseline), color);
-        if base >= 2 {
-            mesh.add_triangle(base - 2, base - 1, base);
-            mesh.add_triangle(base - 1, base, base + 1);
+        if base >= 3 {
+            let previous = base - 3;
+            mesh.add_triangle(previous, previous + 1, base);
+            mesh.add_triangle(previous + 1, base, base + 1);
+            mesh.add_triangle(previous + 1, previous + 2, base + 1);
+            mesh.add_triangle(previous + 2, base + 1, base + 2);
         }
     }
     Shape::Mesh(mesh.into())
@@ -1261,6 +1376,7 @@ fn vertical_gradient_area(
     color: Color32,
     edge_alpha: f32,
     middle_alpha: f32,
+    feather: f32,
 ) -> Shape {
     let mut mesh = Mesh::default();
     if points.len() < 2 || plot.height() <= 0.0 {
@@ -1276,11 +1392,21 @@ fn vertical_gradient_area(
 
     for p in points {
         let base = mesh.vertices.len() as u32;
-        mesh.colored_vertex(*p, at(p.y));
+        let toward_baseline = (baseline - p.y).signum();
+        let inner_y = if toward_baseline >= 0.0 {
+            (p.y + feather).min(baseline)
+        } else {
+            (p.y - feather).max(baseline)
+        };
+        mesh.colored_vertex(*p, Color32::TRANSPARENT);
+        mesh.colored_vertex(pos2(p.x, inner_y), at(p.y));
         mesh.colored_vertex(pos2(p.x, baseline), at(baseline));
-        if base >= 2 {
-            mesh.add_triangle(base - 2, base - 1, base);
-            mesh.add_triangle(base - 1, base, base + 1);
+        if base >= 3 {
+            let previous = base - 3;
+            mesh.add_triangle(previous, previous + 1, base);
+            mesh.add_triangle(previous + 1, base, base + 1);
+            mesh.add_triangle(previous + 1, previous + 2, base + 1);
+            mesh.add_triangle(previous + 2, base + 1, base + 2);
         }
     }
     Shape::Mesh(mesh.into())
@@ -1349,19 +1475,28 @@ mod tests {
     }
 
     #[test]
+    fn wheel_steps_keep_fast_scroll_magnitude() {
+        assert_eq!(wheel_steps(0.0), 0.0);
+        assert!(wheel_steps(14.0) > 0.9);
+        assert!(wheel_steps(-14.0) < -0.9);
+        assert!(wheel_steps(56.0) > wheel_steps(14.0));
+    }
+
+    #[test]
     fn an_area_mesh_covers_every_column_it_is_given() {
         let points: Vec<Pos2> = (0..8).map(|i| pos2(i as f32 * 10.0, 20.0)).collect();
-        let Shape::Mesh(mesh) = area_mesh(&points, 100.0, Color32::RED) else {
+        let Shape::Mesh(mesh) = area_mesh(&points, 100.0, Color32::RED, 1.0) else {
             panic!("not a mesh");
         };
-        assert_eq!(mesh.vertices.len(), 16);
-        // Two triangles per gap between columns.
-        assert_eq!(mesh.indices.len(), (points.len() - 1) * 6);
+        assert_eq!(mesh.vertices.len(), 24);
+        // Two triangles for the feather and two for the body per column gap.
+        assert_eq!(mesh.indices.len(), (points.len() - 1) * 12);
+        assert_eq!(mesh.vertices[0].color, Color32::TRANSPARENT);
     }
 
     #[test]
     fn a_degenerate_area_is_empty_rather_than_malformed() {
-        let Shape::Mesh(mesh) = area_mesh(&[pos2(0.0, 0.0)], 10.0, Color32::RED) else {
+        let Shape::Mesh(mesh) = area_mesh(&[pos2(0.0, 0.0)], 10.0, Color32::RED, 1.0) else {
             panic!("not a mesh");
         };
         assert!(mesh.indices.is_empty());

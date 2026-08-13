@@ -44,6 +44,7 @@ use crate::gui::gpu::FxRenderer;
 use crate::gui::panels::{header::HeaderState, Floating};
 use crate::gui::state::{read_bands, UiState, PANEL_MIN};
 use crate::gui::theme::{fade, MOCHI, NEON, PLOT_BOTTOM, PLOT_TOP};
+use crate::gui::widgets::io_meter::IoMeterState;
 use crate::meters::Meters;
 use crate::params::{EquzxParams, TransientState, MAX_BANDS};
 
@@ -57,6 +58,9 @@ pub const MIN_HEIGHT: f32 = 420.0;
 const INSET: f32 = 12.0;
 /// Clearance between a floating panel and the plot underneath it.
 const CLEARANCE: f32 = 20.0;
+/// Width and breathing room for each compact stereo I/O meter.
+const IO_METER_WIDTH: f32 = 30.0;
+const IO_METER_GAP: f32 = 8.0;
 
 pub struct EditorContext {
     pub params: Arc<EquzxParams>,
@@ -98,6 +102,7 @@ struct View {
     persisted: String,
     restored: bool,
     selected: Option<usize>,
+    io_meter: IoMeterState,
 
     /// Heights measured last frame, which is what keeps the plot clear of two
     /// panels whose size depends on their own contents.
@@ -134,6 +139,7 @@ impl View {
             persisted: String::new(),
             restored: false,
             selected: None,
+            io_meter: IoMeterState::default(),
             header_height: 54.0,
             bottom_height: 244.0,
         }
@@ -143,11 +149,19 @@ impl View {
 pub fn create(ctx: EditorContext) -> Option<Box<dyn Editor>> {
     let state = ctx.params.editor_state.clone();
     let app = App::new(ctx.sample_rate.load(Ordering::Relaxed));
+    let opening_meters = ctx.meters.clone();
 
     create_egui_editor(
         state.clone(),
         app,
-        |egui_ctx, _| theme::apply(egui_ctx),
+        move |egui_ctx, app| {
+            theme::apply(egui_ctx);
+            // The editor state survives a host closing and reopening its
+            // window. Do not let a peak accumulated while it was closed flash
+            // on the newly opened meter.
+            let _ = opening_meters.take_io();
+            app.view.io_meter.reset();
+        },
         move |egui_ctx, setter, app| {
             let sample_rate = ctx.sample_rate.load(Ordering::Relaxed);
             app.analyzer.set_sample_rate(sample_rate);
@@ -164,6 +178,11 @@ pub fn create(ctx: EditorContext) -> Option<Box<dyn Editor>> {
             ctx.meters.read_into(&mut readings.level, &mut readings.delta);
             readings.resonance_peak = ctx.meters.read_resonance(&mut readings.resonance);
             ctx.meters.read_targets(&mut readings.targets);
+            let now = egui_ctx.input(|input| input.time);
+            view.io_meter.update(ctx.meters.take_io(), now);
+            if view.io_meter.is_active(now) {
+                egui_ctx.request_repaint();
+            }
 
             // The view state belongs to the user once they have touched it, so
             // it is restored once and then owned here.
@@ -227,10 +246,14 @@ fn layout(ui: &mut Ui, frame: &Frame, app: &mut View, bands: &[state::BandView])
             full.max.y - INSET - app.bottom_height - CLEARANCE,
         ),
     );
-    if plot_rect.height() > 60.0 {
+    let (display_rect, input_meter, output_meter) = io_meter_rects(plot_rect);
+
+    if display_rect.height() > 60.0 && display_rect.width() > 120.0 {
         app.display
-            .show(ui, plot_rect, frame, bands, &app.ui, &mut app.selected);
-        hint(ui, plot_rect, bands.is_empty());
+            .show(ui, display_rect, frame, bands, &app.ui, &mut app.selected);
+        hint(ui, display_rect, bands.is_empty());
+        let now = ui.input(|input| input.time);
+        app.io_meter.show(ui, input_meter, output_meter, now);
     }
 
     // --- the analyser pickers, over the plot's top-right corner -----------
@@ -239,7 +262,7 @@ fn layout(ui: &mut Ui, frame: &Frame, app: &mut View, bands: &[state::BandView])
     let fx = frame.fx.clone();
     Floating::new(
         "analyzer-overlay",
-        pos2(plot_rect.max.x - INSET, plot_rect.min.y + INSET),
+        pos2(display_rect.max.x - INSET, display_rect.min.y + INSET),
     )
     .pivot(Align2::RIGHT_TOP)
     .padding(vec2(4.0, 4.0))
@@ -294,6 +317,24 @@ fn layout(ui: &mut Ui, frame: &Frame, app: &mut View, bands: &[state::BandView])
             );
         });
     app.bottom_height = bottom.height();
+}
+
+fn io_meter_rects(plot_rect: Rect) -> (Rect, Rect, Rect) {
+    let meter_top = plot_rect.min.y + 8.0;
+    let meter_bottom = plot_rect.max.y - 8.0;
+    let input = Rect::from_min_max(
+        pos2(plot_rect.min.x + 6.0, meter_top),
+        pos2(plot_rect.min.x + 6.0 + IO_METER_WIDTH, meter_bottom),
+    );
+    let output = Rect::from_min_max(
+        pos2(plot_rect.max.x - 6.0 - IO_METER_WIDTH, meter_top),
+        pos2(plot_rect.max.x - 6.0, meter_bottom),
+    );
+    let display = Rect::from_min_max(
+        pos2(input.max.x + IO_METER_GAP, plot_rect.min.y),
+        pos2(output.min.x - IO_METER_GAP, plot_rect.max.y),
+    );
+    (display, input, output)
 }
 
 /// The field the plot sits on: a vertical gradient, and the ambient light along
@@ -531,6 +572,16 @@ mod tests {
         view: &mut View,
         bands: &[state::BandView],
     ) -> Vec<nih_plug_egui::egui::ClippedPrimitive> {
+        run_frame_with_io(harness, view, bands, crate::meters::IoPeaks::default(), 0.0)
+    }
+
+    fn run_frame_with_io(
+        harness: &Harness,
+        view: &mut View,
+        bands: &[state::BandView],
+        io: crate::meters::IoPeaks,
+        time: f64,
+    ) -> Vec<nih_plug_egui::egui::ClippedPrimitive> {
         let host = HeadlessHost;
         let setter = ParamSetter::new(&host);
         let level = vec![-18.0f32; MAX_BANDS];
@@ -553,6 +604,7 @@ mod tests {
             confidence: 0.4,
         };
         let fx = view.fx.clone();
+        view.io_meter.update(io, time);
         let frame = Frame {
             setter: &setter,
             params: &harness.params,
@@ -570,6 +622,7 @@ mod tests {
 
         harness.ctx.begin_pass(RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, harness.size)),
+            time: Some(time),
             ..Default::default()
         });
         ResizableWindow::new("equzx-window")
@@ -593,6 +646,22 @@ mod tests {
             })
             .flat_map(|mesh| mesh.vertices.iter())
             .filter(|v| rect.contains(v.pos))
+            .count()
+    }
+
+    fn colored_vertices_within(
+        primitives: &[nih_plug_egui::egui::ClippedPrimitive],
+        rect: Rect,
+        colors: &[Color32],
+    ) -> usize {
+        primitives
+            .iter()
+            .filter_map(|primitive| match &primitive.primitive {
+                nih_plug_egui::egui::epaint::Primitive::Mesh(mesh) => Some(mesh),
+                _ => None,
+            })
+            .flat_map(|mesh| mesh.vertices.iter())
+            .filter(|vertex| rect.contains(vertex.pos) && colors.contains(&vertex.color))
             .count()
     }
 
@@ -648,6 +717,68 @@ mod tests {
                 "nothing drawn with {selected:?} selected"
             );
         }
+    }
+
+    #[test]
+    fn io_meters_tessellate_at_silence_and_hot_stereo_levels() {
+        let (harness, mut view) = fixture_sized(MIN_WIDTH, DEFAULT_HEIGHT as f32);
+        let bands = a_bit_of_everything();
+
+        // Let the floating panels settle before deriving the exact plot slot.
+        for pass in 0..2 {
+            run_frame_with_io(
+                &harness,
+                &mut view,
+                &bands,
+                crate::meters::IoPeaks::default(),
+                pass as f64 / 60.0,
+            );
+        }
+        let plot = Rect::from_min_max(
+            pos2(0.0, INSET + view.header_height + CLEARANCE),
+            pos2(
+                harness.size.x,
+                harness.size.y - INSET - view.bottom_height - CLEARANCE,
+            ),
+        );
+        let (display, input, output) = io_meter_rects(plot);
+        assert!(display.width() > 120.0);
+        assert!(input.width() >= IO_METER_WIDTH && output.width() >= IO_METER_WIDTH);
+
+        let silence = run_frame_with_io(
+            &harness,
+            &mut view,
+            &bands,
+            crate::meters::IoPeaks::default(),
+            0.1,
+        );
+        let silent_input = vertices_within(&silence, input);
+        let silent_output = vertices_within(&silence, output);
+        assert!(silent_input > 0 && silent_output > 0);
+
+        let hot = run_frame_with_io(
+            &harness,
+            &mut view,
+            &bands,
+            crate::meters::IoPeaks {
+                input: [1.0, 0.5],
+                output: [1.2, 0.25],
+            },
+            0.2,
+        );
+        let signal_colors = [fade(NEON, 0.92), fade(MOCHI, 0.72)];
+        assert!(
+            colored_vertices_within(&hot, input, &signal_colors) > 0,
+            "hot input produced no filled meter rails"
+        );
+        assert!(
+            colored_vertices_within(&hot, output, &signal_colors) > 0,
+            "hot output produced no filled meter rails"
+        );
+        assert!(
+            colored_vertices_within(&hot, output, &[Color32::from_rgb(0xff, 0x54, 0x62)]) > 0,
+            "over-full-scale output produced no clip indicator"
+        );
     }
 
     /// The one that would have caught shipping an editor with no panels on it.
@@ -926,7 +1057,7 @@ mod tests {
         // A few passes, because the first is egui measuring its areas.
         let mut atlas = None;
         let mut primitives = Vec::new();
-        for _ in 0..4 {
+        for pass in 0..4 {
             let host = HeadlessHost;
             let setter = ParamSetter::new(&host);
             let level = vec![-22.0f32; MAX_BANDS];
@@ -954,6 +1085,13 @@ mod tests {
                 confidence: 0.8,
             };
             let fx = view.fx.clone();
+            view.io_meter.update(
+                crate::meters::IoPeaks {
+                    input: [0.83, 0.64],
+                    output: [1.02, 0.58],
+                },
+                pass as f64 / 60.0,
+            );
             let frame = Frame {
                 setter: &setter,
                 params: &harness.params,
@@ -971,6 +1109,7 @@ mod tests {
 
             harness.ctx.begin_pass(RawInput {
                 screen_rect: Some(Rect::from_min_size(Pos2::ZERO, harness.size)),
+                time: Some(pass as f64 / 60.0),
                 ..Default::default()
             });
             ResizableWindow::new("equzx-window")

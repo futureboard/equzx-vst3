@@ -22,7 +22,7 @@ use crate::analyzer::Taps;
 use crate::dsp::engine::{settings_for_block, EqEngine, CONTROL_BLOCK};
 use crate::dsp::resonance::RES_BANDS;
 use crate::dsp::spectral::{SpectralWorker, TargetView, MAX_TARGETS};
-use crate::meters::Meters;
+use crate::meters::{IoPeaks, Meters};
 use crate::params::{EquzxParams, TransientState, MAX_BANDS};
 
 pub struct Equzx {
@@ -145,6 +145,7 @@ impl Plugin for Equzx {
         let sr = self.engine.sample_rate();
         let channels = buffer.channels();
         let slices = buffer.as_slice();
+        let mut io_peaks = IoPeaks::default();
 
         let mut offset = 0;
         while offset < num_samples {
@@ -164,11 +165,15 @@ impl Plugin for Equzx {
             match &right {
                 Some(r) => {
                     for i in 0..n {
-                        self.taps.pre.push(0.5 * (left[i] + r[i]));
+                        let (l, r) = (left[i], r[i]);
+                        io_peaks.input[0] = io_peaks.input[0].max(finite_peak(l));
+                        io_peaks.input[1] = io_peaks.input[1].max(finite_peak(r));
+                        self.taps.pre.push(0.5 * (l + r));
                     }
                 }
                 None => {
                     for &x in left.iter() {
+                        io_peaks.input[0] = io_peaks.input[0].max(finite_peak(x));
                         self.taps.pre.push(x);
                     }
                 }
@@ -179,14 +184,17 @@ impl Plugin for Equzx {
             match slices.get(1) {
                 Some(r) if channels >= 2 => {
                     for i in 0..n {
-                        self.taps
-                            .post
-                            .push(0.5 * (slices[0][offset + i] + r[offset + i]));
+                        let (l, r) = (slices[0][offset + i], r[offset + i]);
+                        io_peaks.output[0] = io_peaks.output[0].max(finite_peak(l));
+                        io_peaks.output[1] = io_peaks.output[1].max(finite_peak(r));
+                        self.taps.post.push(0.5 * (l + r));
                     }
                 }
                 _ => {
                     for i in 0..n {
-                        self.taps.post.push(slices[0][offset + i]);
+                        let x = slices[0][offset + i];
+                        io_peaks.output[0] = io_peaks.output[0].max(finite_peak(x));
+                        self.taps.post.push(x);
                     }
                 }
             }
@@ -202,8 +210,18 @@ impl Plugin for Equzx {
             .publish_resonance(&self.resonance_curve, self.engine.resonance_peak());
         self.engine.spectral_view(&mut self.target_views);
         self.meters.publish_targets(&self.target_views);
+        self.meters.publish_io(io_peaks);
 
         ProcessStatus::Normal
+    }
+}
+
+#[inline]
+fn finite_peak(value: f32) -> f32 {
+    if value.is_finite() {
+        value.abs()
+    } else {
+        0.0
     }
 }
 
@@ -280,6 +298,24 @@ mod tests {
         }
     }
 
+    /// Run one caller-owned stereo buffer through the plugin.
+    fn process_stereo(plugin: &mut Equzx, left: &mut [f32], right: &mut [f32]) {
+        assert_eq!(left.len(), right.len());
+        let samples = left.len();
+        let mut slices = [left, right];
+        let mut buffer = Buffer::default();
+        unsafe {
+            buffer.set_slices(samples, |output| {
+                *output = slices.iter_mut().map(|slice| &mut **slice).collect();
+            });
+        }
+        let mut aux = AuxiliaryBuffers {
+            inputs: &mut [],
+            outputs: &mut [],
+        };
+        plugin.process(&mut buffer, &mut aux, &mut DummyContext);
+    }
+
     /// The minimum a `ProcessContext` has to be for `process` to run.
     struct DummyContext;
 
@@ -348,6 +384,52 @@ mod tests {
                 "R changed at {i}"
             );
         }
+    }
+
+    #[test]
+    fn io_meters_keep_asymmetric_stereo_peaks() {
+        let mut plugin = Equzx::default();
+        let mut left = [0.10, -0.80, 0.35, 0.0];
+        let mut right = [-0.25, 0.20, 0.60, 0.0];
+
+        process_stereo(&mut plugin, &mut left, &mut right);
+
+        assert_eq!(
+            plugin.meters.take_io(),
+            IoPeaks {
+                input: [0.80, 0.60],
+                output: [0.80, 0.60],
+            }
+        );
+    }
+
+    #[test]
+    fn io_meters_do_not_cancel_an_antiphase_pair() {
+        let mut plugin = Equzx::default();
+        let mut left = [0.25, -1.0, 0.50, -0.75];
+        let mut right = [-0.25, 1.0, -0.50, 0.75];
+
+        process_stereo(&mut plugin, &mut left, &mut right);
+
+        let peaks = plugin.meters.take_io();
+        assert_eq!(peaks.input, [1.0, 1.0]);
+        assert_eq!(peaks.output, [1.0, 1.0]);
+    }
+
+    #[test]
+    fn io_meters_measure_output_after_output_gain() {
+        let mut plugin = Equzx::default();
+        plugin.params.output_gain.smoothed.reset(-6.0);
+        let mut left = [1.0, -0.50, 0.25, 0.0];
+        let mut right = [-0.25, 0.75, -0.50, 0.0];
+
+        process_stereo(&mut plugin, &mut left, &mut right);
+
+        let peaks = plugin.meters.take_io();
+        let gain = 10f32.powf(-6.0 / 20.0);
+        assert_eq!(peaks.input, [1.0, 0.75]);
+        assert!((peaks.output[0] - gain).abs() < 1e-6);
+        assert!((peaks.output[1] - 0.75 * gain).abs() < 1e-6);
     }
 
     #[test]
