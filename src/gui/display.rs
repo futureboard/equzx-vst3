@@ -439,7 +439,7 @@ impl Display {
             let centre = pos2(axes.x(band.freq), axes.y(band.handle_db()));
 
             // The Q grips, which only the selected band shows.
-            if *selected == Some(band.slot) && band.kind.uses_q() {
+            if *selected == Some(band.slot) && shows_bandwidth_grips(band.kind) {
                 let bandwidth = curves::q_to_octaves(band.q);
                 for side in [-1.0f32, 1.0] {
                     let qx = axes.x(band.freq * 2f32.powf(side * bandwidth / 2.0));
@@ -520,7 +520,7 @@ impl Display {
         }
         self.hovered = hovered;
 
-        // --- wheel: Q for the resonant types, slope for the cuts ------------
+        // --- wheel: slope where there is one, Q everywhere else -------------
         let focus = hovered.or(*selected);
         if let Some(slot) = focus {
             if background.hovered() || hovered.is_some() {
@@ -530,9 +530,9 @@ impl Display {
                         // Scrolling up should open the filter out, which is the
                         // opposite sign to the wheel's own.
                         let up = scroll > 0.0;
-                        if band.kind.is_cut() {
+                        if band.kind.uses_slope() {
                             edit::step_slope(frame, slot, if up { -1 } else { 1 });
-                        } else if band.kind.uses_q() {
+                        } else if band.kind.uses_q(band.slope) {
                             let factor = if fine { 1.02 } else { 1.1 };
                             let q = if up {
                                 band.q * factor
@@ -599,7 +599,7 @@ impl Display {
                 ));
             }
 
-            if active && band.kind.uses_q() {
+            if active && shows_bandwidth_grips(band.kind) {
                 let bandwidth = curves::q_to_octaves(band.q);
                 for side in [-1.0f32, 1.0] {
                     let qx = axes.x(band.freq * 2f32.powf(side * bandwidth / 2.0));
@@ -699,10 +699,11 @@ impl Display {
                 format!("{}{:.1} dB", if band.gain >= 0.0 { "+" } else { "" }, band.gain),
                 white(190),
             ));
-        } else {
+        }
+        if band.kind.uses_slope() {
             lines.push((format!("{} dB/oct", band.slope.db_per_oct()), white(190)));
         }
-        if band.kind.uses_q() {
+        if band.kind.uses_q(band.slope) {
             lines.push((format!("Q {:.2}", band.q), white(190)));
         }
         if band.dynamic && band.kind.uses_gain() {
@@ -1285,22 +1286,14 @@ fn vertical_gradient_area(
     Shape::Mesh(mesh.into())
 }
 
+fn shows_bandwidth_grips(kind: crate::params::BandKind) -> bool {
+    use crate::params::BandKind::*;
+    matches!(kind, Bell | Notch | BandPass)
+}
+
 /// A dashed segment, which egui has no primitive for at this granularity.
 fn dashed_line(from: Pos2, to: Pos2, stroke: Stroke, dash: f32, gap: f32) -> Shape {
     Shape::dashed_line(&[from, to], stroke, dash, gap).into()
-}
-
-trait KindExt {
-    fn uses_q(self) -> bool;
-}
-
-impl KindExt for crate::params::BandKind {
-    /// Shelves are fixed at S = 1 in the engine, so exposing a Q for them would
-    /// be a control that changes nothing.
-    fn uses_q(self) -> bool {
-        use crate::params::BandKind::*;
-        matches!(self, Bell | Notch | BandPass)
-    }
 }
 
 #[cfg(test)]
@@ -1375,13 +1368,24 @@ mod tests {
     }
 
     #[test]
-    fn only_the_resonant_types_offer_a_q() {
+    fn only_the_bandwidth_types_draw_q_grips() {
         use crate::params::BandKind::*;
         for kind in [Bell, Notch, BandPass] {
-            assert!(kind.uses_q(), "{kind:?}");
+            assert!(shows_bandwidth_grips(kind), "{kind:?}");
         }
+        // A cut has a Q, but it is a resonance rather than a width, no grips.
         for kind in [LowCut, HighCut, LowShelf, HighShelf] {
-            assert!(!kind.uses_q(), "{kind:?}");
+            assert!(!shows_bandwidth_grips(kind), "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_cut_offers_a_q_unless_it_is_a_single_pole() {
+        use crate::params::BandKind::*;
+        use crate::params::Slope;
+        assert!(LowCut.uses_q(Slope::S24));
+        assert!(!LowCut.uses_q(Slope::S6));
+        // Shelves never did and still do not.
+        assert!(!LowShelf.uses_q(Slope::S24));
     }
 }

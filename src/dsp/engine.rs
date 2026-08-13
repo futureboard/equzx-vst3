@@ -40,7 +40,7 @@
 
 use std::sync::Arc;
 
-use crate::dsp::biquad::{butterworth_qs, Biquad, Coeffs, MAX_SECTIONS};
+use crate::dsp::biquad::{band_cascade, Biquad, Coeffs, MAX_SECTIONS};
 use crate::dsp::dynamics::{dynamic_step, step_toward, DynSettings, LevelDetector};
 use crate::dsp::resonance::{
     band_freq, band_region_weight, crossfade, BandOverlays, ResonanceBank, ResonanceSettings,
@@ -101,7 +101,7 @@ impl Default for BandPlan {
             order: 4,
             freq: 1000.0,
             gain: 0.0,
-            q: 1.0,
+            q: crate::dsp::biquad::FLAT_Q,
             dynamic: false,
             dyn_mode: DynMode::Above,
             dyn_range: 0.0,
@@ -355,41 +355,8 @@ impl BandRuntime {
             return;
         }
         self.key = key;
-
-        match kind {
-            BandKind::Bell => {
-                self.coeffs[0] = Coeffs::peaking(freq, q, gain, sr);
-                self.sections = 1;
-            }
-            BandKind::LowShelf => {
-                self.coeffs[0] = Coeffs::low_shelf(freq, gain, sr);
-                self.sections = 1;
-            }
-            BandKind::HighShelf => {
-                self.coeffs[0] = Coeffs::high_shelf(freq, gain, sr);
-                self.sections = 1;
-            }
-            BandKind::Notch => {
-                self.coeffs[0] = Coeffs::notch(freq, q, sr);
-                self.sections = 1;
-            }
-            BandKind::BandPass => {
-                self.coeffs[0] = Coeffs::bandpass(freq, q, sr);
-                self.sections = 1;
-            }
-            BandKind::LowCut | BandKind::HighCut => {
-                let mut qs = [0.0f32; MAX_SECTIONS];
-                let n = butterworth_qs(order, &mut qs);
-                for i in 0..n {
-                    self.coeffs[i] = if kind == BandKind::LowCut {
-                        Coeffs::highpass(freq, qs[i], sr)
-                    } else {
-                        Coeffs::lowpass(freq, qs[i], sr)
-                    };
-                }
-                self.sections = n;
-            }
-        }
+        self.coeffs = [Coeffs::identity(); MAX_SECTIONS];
+        self.sections = band_cascade(kind, freq, sr, order, q, gain, &mut self.coeffs);
     }
 
     /// The sidechain listens through the slice of spectrum the band acts on:
@@ -1145,6 +1112,13 @@ mod tests {
         }
     }
 
+    fn bell_coeffs(freq: f32, q: f32, gain: f32) -> Coeffs {
+        let mut sections = [Coeffs::identity(); MAX_SECTIONS];
+        let n = band_cascade(BandKind::Bell, freq, SR, 2, q, gain, &mut sections);
+        assert_eq!(n, 1, "a bell is one section");
+        sections[0]
+    }
+
     fn one_band(plan: BandPlan) -> Settings {
         let mut s = Settings::default();
         s.bands[0] = plan;
@@ -1277,7 +1251,7 @@ mod tests {
     #[test]
     fn steeper_slopes_cut_harder() {
         let mut last = f32::INFINITY;
-        for slope in [Slope::S12, Slope::S24, Slope::S48, Slope::S96] {
+        for slope in [Slope::S6, Slope::S12, Slope::S24, Slope::S36, Slope::S48] {
             let s = one_band(BandPlan {
                 running: true,
                 kind: BandKind::LowCut,
@@ -1287,8 +1261,10 @@ mod tests {
             });
             let mut engine = EqEngine::new(SR);
             let out = rms_db(&mut engine, &s, 500.0, true);
+            // One octave down, each step of the list is a further 6 dB/oct of
+            // asymptote. Except the first, which is still inside the knee.
             assert!(
-                out < last - 5.0,
+                out < last - 4.5,
                 "{:?} gave {out} dB, previous was {last}",
                 slope
             );
@@ -1348,7 +1324,7 @@ mod tests {
         let s = one_band(bell(800.0, 9.0, 2.0));
 
         // Reference: the same filter run straight on L.
-        let c = Coeffs::peaking(800.0, 2.0, 9.0, SR);
+        let c = bell_coeffs(800.0, 2.0, 9.0);
         let mut reference = Biquad::new();
 
         for block in 0..64 {
@@ -1458,8 +1434,8 @@ mod tests {
             ..bell(400.0, -7.0, 0.9)
         };
 
-        let left_coeffs = Coeffs::peaking(1500.0, 1.5, 8.0, SR);
-        let mid_coeffs = Coeffs::peaking(400.0, 0.9, -7.0, SR);
+        let left_coeffs = bell_coeffs(1500.0, 1.5, 8.0);
+        let mid_coeffs = bell_coeffs(400.0, 0.9, -7.0);
         let mut left_filter = Biquad::new();
         let mut mid_filter = Biquad::new();
 
@@ -2083,14 +2059,14 @@ mod tests {
             running: true,
             kind: BandKind::LowCut,
             freq: 30.0,
-            order: Slope::S96.order(),
+            order: Slope::S48.order(),
             ..BandPlan::default()
         };
         s.bands[23] = BandPlan {
             running: true,
             kind: BandKind::HighCut,
             freq: 18_000.0,
-            order: Slope::S96.order(),
+            order: Slope::S48.order(),
             ..BandPlan::default()
         };
 

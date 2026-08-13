@@ -33,7 +33,11 @@ const MAGIC: &[u8; 4] = b"FBPF";
 /// Bumped only for changes the reader below could not skip over. Version 2
 /// added the resonance mode/quality/range and the per-band resonance fields;
 /// version 1 files still load, with those fields on their defaults.
-const PST_VERSION: u16 = 3;
+///
+/// Version 4 changes no layout — it marks where a cut band's Q started meaning
+/// something, so older files load below [`crate::gui::state::SCHEMA_CUT_Q`] and
+/// the snapshot's own migration puts their cuts back on flat.
+const PST_VERSION: u16 = 4;
 
 const EXTENSION: &str = "pst";
 const LEGACY_EXTENSION: &str = "equz.json";
@@ -71,7 +75,8 @@ struct PresetFile {
 ///   u8                  kind      (0 lowcut, 1 lowshelf, 2 bell, 3 notch,
 ///                                  4 bandpass, 5 highshelf, 6 highcut)
 ///   u8                  channel   (0 stereo, 1 mid, 2 side, 3 left, 4 right)
-///   u8                  slope, dB/oct (12..96)
+///   u8                  slope, dB/oct (6..48; 72 and 96 from older files
+///                       round to the nearest this build offers)
 ///   u8                  flags     (bit 0 enabled, bit 1 dynamic,
 ///                                  bit 2 dyn mode = below)
 ///   f32 × 8             freq, gain, q, dyn range, threshold, attack,
@@ -232,7 +237,8 @@ fn decode(bytes: &[u8]) -> Option<PresetFile> {
             4 => BandChannel::Right,
             _ => BandChannel::Stereo,
         };
-        let slope = Slope::from_db_per_oct(cur.take(1)?[0] as u32).unwrap_or(Slope::S24);
+        // 72 and 96 predate the 48 dB/oct cap; they land on the steepest.
+        let slope = Slope::nearest_db_per_oct(cur.take(1)?[0] as u32);
         let flags = cur.take(1)?[0];
         let mut band = BandSnapshot {
             kind,
@@ -278,6 +284,11 @@ fn decode(bytes: &[u8]) -> Option<PresetFile> {
             output_gain,
             phase_invert,
             resonance,
+            schema: if version >= 4 {
+                crate::gui::state::SCHEMA
+            } else {
+                crate::gui::state::SCHEMA_CUT_Q - 1
+            },
         },
     })
 }
@@ -588,12 +599,13 @@ mod tests {
         let snapshot = Snapshot {
             output_gain: -2.25,
             phase_invert: true,
+            schema: crate::gui::state::SCHEMA,
             bands: vec![
                 BandSnapshot {
                     kind: BandKind::HighCut,
                     channel: BandChannel::Side,
                     freq: 12_000.0,
-                    slope: Slope::S96,
+                    slope: Slope::S48,
                     enabled: false,
                     ..BandSnapshot::default()
                 },

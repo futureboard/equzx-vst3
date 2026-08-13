@@ -47,15 +47,23 @@ impl Frame<'_> {
     }
 }
 
-/// Cut slopes in the order the wheel and the button row step through them.
-pub const SLOPES: [Slope; 6] = [
+/// Slopes in the order the wheel and the button row step through them.
+pub const SLOPES: [Slope; 5] = [
+    Slope::S6,
     Slope::S12,
     Slope::S24,
     Slope::S36,
     Slope::S48,
-    Slope::S72,
-    Slope::S96,
 ];
+
+/// Index into [`SLOPES`] a band of this kind may not step below. A matched
+/// shelf has no 6 dB/oct form, so its row starts one step in.
+pub fn slope_floor(kind: BandKind) -> usize {
+    match kind {
+        BandKind::LowShelf | BandKind::HighShelf => 1,
+        _ => 0,
+    }
+}
 
 // --- primitives --------------------------------------------------------------
 
@@ -121,16 +129,17 @@ band_setter!(set_band_res_width, res_width, set_float, f32);
 band_setter!(set_band_res_attack, res_attack, set_float, f32);
 band_setter!(set_band_res_release, res_release, set_float, f32);
 
-/// Move a cut band's slope by one step of the list.
+/// Move a band's slope by one step of the list.
 pub fn step_slope(frame: &Frame, slot: usize, direction: i32) {
     let Some(band) = frame.band(slot) else {
         return;
     };
+    let floor = slope_floor(band.kind.value()) as i32;
     let current = SLOPES
         .iter()
         .position(|s| *s == band.slope.value())
-        .unwrap_or(1) as i32;
-    let next = (current + direction).clamp(0, SLOPES.len() as i32 - 1) as usize;
+        .unwrap_or(2) as i32;
+    let next = (current + direction).clamp(floor, SLOPES.len() as i32 - 1) as usize;
     set_enum(frame.setter, &band.slope, SLOPES[next]);
 }
 
@@ -290,7 +299,14 @@ mod tests {
         // Steps run from shallowest to steepest, which is what makes the wheel
         // direction mean something.
         let steps: Vec<u32> = SLOPES.iter().map(|s| s.db_per_oct()).collect();
-        assert_eq!(steps, vec![12, 24, 36, 48, 72, 96]);
+        assert_eq!(steps, vec![6, 12, 24, 36, 48]);
+    }
+
+    #[test]
+    fn shelves_start_one_step_in() {
+        assert_eq!(SLOPES[slope_floor(BandKind::LowShelf)], Slope::S12);
+        assert_eq!(SLOPES[slope_floor(BandKind::HighShelf)], Slope::S12);
+        assert_eq!(SLOPES[slope_floor(BandKind::LowCut)], Slope::S6);
     }
 
     #[test]
